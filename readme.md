@@ -2,18 +2,58 @@
 
 [中文](readme.zh-CN.md)
 
-Splatplost is a software-based Splatpost plotter based on [libnxctrl](https://github.com/Victrid/libnxctrl). Unlike the former commonly used USB printer which requires a Teensy, or AVR based microcontrollers, You only need a device with bluetooth connection, which is easy to use. With an optimized printing algorithm, this can save you up to 1/3 time printing it.
+Splatplost is a Splatpost plotter based on [libnxctrl](https://github.com/Victrid/libnxctrl). It can drive a controller through Linux Bluetooth, a compatible USB serial adapter on Windows or Linux, or a remote Linux backend. Its optimized plotting algorithm can reduce printing time by up to one third.
 
 ## Basic Usage
 
 ### Installation
 
-It's recommended to use a physical linux machine. If you don't have one, you may check the [flashable image](docs/image.md). Windows or macOS is not supported, as libnxctrl is based on bluez, the linux bluetooth stack.
+Splatplost supports Windows and Linux. Image planning works on both platforms. Controller output is available through:
+
+- **Windows:** a Splatplost-compatible USB serial adapter, or a remote `libnxctrl` server running on Linux.
+- **Linux:** the Bluetooth `nxbt` backend, USB serial adapter, or a remote server.
+
+Windows cannot use the BlueZ-only `nxbt` backend directly. The USB backend requires compatible controller-emulation hardware connected as a Windows COM port; an ordinary USB cable is not enough.
+
+#### Windows executable
+
+Download the `splatplost-windows-x64` artifact from a GitHub Actions run and extract it. No Python installation is needed.
+
+Generate a plotting plan:
+
+```powershell
+.\splatplan.exe -i .\image.png -o .\order.txt
+```
+
+List serial ports and print through a USB adapter:
+
+```powershell
+.\splatplot.exe --list-ports
+.\splatplot.exe --backend usb --serial-port COM3 --order .\order.txt
+```
+
+Alternatively, connect to a Linux machine running the `libnxctrl` server:
+
+```powershell
+.\splatplot.exe --backend remote --remote-server http://192.168.1.10:15973 --order .\order.txt
+```
+
+#### Install from source on Windows
+
+Python 3.9 or newer is required.
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install .
+```
+
+#### Linux Bluetooth installation
 
 You need to use `sudo`, or root, as altering bluetooth is a privileged operation.
 
 ```bash
-sudo pip install splatplost
+sudo python3 -m pip install ".[bluetooth]"
 ```
 
 This will automatically install the required dependencies.
@@ -25,13 +65,13 @@ If you need to update the library, you can use `pip install --upgrade splatplost
 Generate a plotting plan with:
 
 ```bash
-sudo splatplan -i <your image> -o <output filename>
+splatplan -i <your image> -o <output filename>
 ```
 
 Start the printer:
 
 ```bash
-sudo splatplot --order <output filename>
+sudo splatplot --backend nxbt --order <output filename>
 ```
 
 You may check the printer's option (for example, stable mode, customizing delay and press time, etc.) with:

@@ -2,18 +2,36 @@
 
 [English](readme.md)
 
-Splatplost 是一个基于 [libnxctrl](https://github.com/Victrid/libnxctrl) 的斯普拉遁投稿绘图器，与以往的需要 Teensy 或基于 AVR 的微控制器的 USB 绘图方案不同，你只需要一台拥有蓝牙适配器的电脑，并且通过优化打印算法，可以节省 1/3 的打印时间。
+Splatplost 是一个基于 [libnxctrl](https://github.com/Victrid/libnxctrl) 的斯普拉遁投稿绘图器。它可以使用 Linux 蓝牙、Windows/Linux 上兼容的 USB 串口适配器，或远程 Linux 后端来驱动控制器；优化后的绘图算法最多可节省约三分之一的打印时间。
 
 ## 基本用法
 
 ### 安装
 
-建议使用 Linux 物理机。如果没有现成机器，可以使用 [预配置镜像](docs/image.zh-CN.md) 中的方法进行配置。由于 libnxctrl 是基于 bluez 这一 Linux 蓝牙协议栈的，本项目不支持 Windows 或 MacOS。
+Splatplost 现在支持 Windows 和 Linux。图像规划可以在两个平台上运行。Windows 绘图需要兼容的 Splatplost USB 串口适配器，或者连接到 Linux 上运行的远程 `libnxctrl` 服务。Windows 不能直接使用基于 BlueZ 的 `nxbt` 蓝牙后端，普通 USB 数据线也不能替代控制器模拟适配器。
+
+Windows 用户可以从 GitHub Actions 下载 `splatplost-windows-x64` 构建产物，解压后直接运行：
+
+```powershell
+.\splatplan.exe -i .\image.png -o .\order.txt
+.\splatplot.exe --list-ports
+.\splatplot.exe --backend usb --serial-port COM3 --order .\order.txt
+```
+
+从源码安装 Windows 版本：
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install .
+```
+
+Linux 蓝牙后端仍然需要 root 权限：
 
 由于操作蓝牙适配器需要 root 权限，你需要使用`sudo`或 root 用户运行相关命令。
 
 ```bash
-sudo pip install splatplost
+sudo python3 -m pip install ".[bluetooth]"
 ```
 
 这将自动安装所需的依赖。
@@ -25,13 +43,13 @@ sudo pip install splatplost
 生成一个绘图计划：
 
 ```bash
-sudo splatplan -i <你的图像> -o <输出文件名>
+splatplan -i <你的图像> -o <输出文件名>
 ```
 
 启动绘图器：
 
 ```bash
-sudo splatplot --order <输出文件名>
+sudo splatplot --backend nxbt --order <输出文件名>
 ```
 
 查看绘图器的选项（例如稳定模式，自定义延迟和按键时间，等等）：

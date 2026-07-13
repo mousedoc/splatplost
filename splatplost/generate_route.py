@@ -2,11 +2,14 @@ import sys
 
 import numpy as np
 from PIL import Image
-from scipy.spatial.distance import cityblock as manhattan_distance
-from skimage import measure
 from tsp_solver.greedy_numpy import solve_tsp as tsp_solver_greedy
 
 from .tsp_solver_dp import solve_tsp_dynamic_programming as tsp_solver_dp
+
+
+def manhattan_distance(point_a, point_b) -> int:
+    """Return the Manhattan distance without requiring SciPy."""
+    return int(np.abs(np.asarray(point_a) - np.asarray(point_b)).sum())
 
 
 class ResetPosition:
@@ -69,20 +72,17 @@ def generate_order_file(seq, filename):
         else:
             command_list += goto_next_point(current, item)
             current = item
-        pass
-    with open(filename, "w+") as f:
+    with open(filename, "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(command_list))
 
 
 def load_images(input_file_name: str) -> np.ndarray:
-    im = Image.open(input_file_name)
-    if not (im.size[0] == 320 and im.size[1] == 120):
-        print("ERROR: Image must be 320px by 120px!")
-        sys.exit()
-    im = im.convert("1")
-    image = np.array(im.getdata()).reshape(120, 320) / 255
-    image = 1 - image.astype(int)
-    return image
+    with Image.open(input_file_name) as im:
+        if im.size != (320, 120):
+            print("ERROR: Image must be 320px by 120px!", file=sys.stderr)
+            raise SystemExit(2)
+        monochrome = np.asarray(im.convert("1"), dtype=np.uint8)
+    return (monochrome == 0).astype(np.uint8)
 
 
 def divide_image(image: np.ndarray):
@@ -97,11 +97,35 @@ def divide_image(image: np.ndarray):
 
 def get_label(image: np.ndarray) -> tuple[np.ndarray, int]:
     """
-    Get connected components of the image and return the label
+    Label 4-connected foreground components without requiring scikit-image.
     """
-    label = measure.label(image, connectivity=1, background=0)
-    label_count = np.max(label)
-    return label, label_count
+    foreground = np.asarray(image, dtype=bool)
+    labels = np.zeros(foreground.shape, dtype=np.int32)
+    rows, columns = foreground.shape
+    label_count = 0
+
+    for row in range(rows):
+        for column in range(columns):
+            if not foreground[row, column] or labels[row, column] != 0:
+                continue
+            label_count += 1
+            labels[row, column] = label_count
+            pending = [(row, column)]
+            while pending:
+                current_row, current_column = pending.pop()
+                for next_row, next_column in (
+                    (current_row - 1, current_column),
+                    (current_row + 1, current_column),
+                    (current_row, current_column - 1),
+                    (current_row, current_column + 1),
+                ):
+                    if not (0 <= next_row < rows and 0 <= next_column < columns):
+                        continue
+                    if foreground[next_row, next_column] and labels[next_row, next_column] == 0:
+                        labels[next_row, next_column] = label_count
+                        pending.append((next_row, next_column))
+
+    return labels, label_count
 
 
 def generate_dense_visit(labeled_image: np.ndarray, label_selector: int, image_offset: np.ndarray) -> list[np.ndarray]:
@@ -159,7 +183,7 @@ def generate_block_visit(image_block: np.ndarray, image_offset: np.ndarray) -> l
 
 def summarize_difficulties(image, output):
     original_difficulty = 2 * np.sum(image) + np.sum(image == 0)
-    with open(output, "r") as f:
+    with open(output, "r", encoding="utf-8") as f:
         current_difficulty = len(f.readlines())
     print("Original difficulty: {}, Current difficulty: {}, reduced: {}".format(
             original_difficulty,
