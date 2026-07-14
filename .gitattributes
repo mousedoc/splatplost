@@ -1,1 +1,1 @@
-native/windows_bluetooth/windows-driver-samples.patch -whitespace
+native/windows_bluetooth/windows-driver-samples.patch text eol=lf -whitespace

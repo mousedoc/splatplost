@@ -1,5 +1,5 @@
 diff --git a/bluetooth/bthecho/bthsrv/sys/BthEchoSampleSrv.vcxproj b/bluetooth/bthecho/bthsrv/sys/BthEchoSampleSrv.vcxproj
-index bf1902a..7e18af3 100644
+index bf1902a..5281bd5 100644
 --- a/bluetooth/bthecho/bthsrv/sys/BthEchoSampleSrv.vcxproj
 +++ b/bluetooth/bthecho/bthsrv/sys/BthEchoSampleSrv.vcxproj
 @@ -76,7 +76,7 @@
@@ -32,13 +32,6 @@ index bf1902a..7e18af3 100644
    </PropertyGroup>
    <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
      <ClCompile>
-@@ -204,4 +204,4 @@
-     <ClInclude Exclude="@(ClInclude)" Include="*.h;*.hpp;*.hxx;*.hm;*.inl;*.xsd" />
-   </ItemGroup>
-   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
--</Project>
-\ No newline at end of file
-+</Project>
 diff --git a/bluetooth/bthecho/bthsrv/sys/bridge.c b/bluetooth/bthecho/bthsrv/sys/bridge.c
 new file mode 100644
 index 0000000..628c881
