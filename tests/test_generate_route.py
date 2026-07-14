@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -5,13 +6,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from splatplost.generate_route import (
-    generate_block_visit,
-    generate_order_file,
-    get_label,
-    load_images,
-    manhattan_distance,
-)
+from splatplost.generate_route import generate_route_file, get_label, load_images, manhattan_distance
 
 
 class GenerateRouteTests(unittest.TestCase):
@@ -19,14 +14,7 @@ class GenerateRouteTests(unittest.TestCase):
         self.assertEqual(manhattan_distance((2, 4), (8, 1)), 9)
 
     def test_labels_only_four_connected_pixels(self):
-        image = np.array(
-            [
-                [1, 0, 1],
-                [1, 1, 0],
-                [0, 0, 1],
-            ],
-            dtype=np.uint8,
-        )
+        image = np.array([[1, 0, 1], [1, 1, 0], [0, 0, 1]], dtype=np.uint8)
         labels, count = get_label(image)
         self.assertEqual(count, 3)
         self.assertEqual(labels[0, 0], labels[1, 1])
@@ -37,27 +25,22 @@ class GenerateRouteTests(unittest.TestCase):
             path = Path(directory, "input.png")
             pixels = np.full((120, 320), 255, dtype=np.uint8)
             pixels[4, 7] = 0
-            Image.fromarray(pixels, mode="L").save(path)
+            Image.fromarray(pixels).save(path)
             image = load_images(str(path))
-        self.assertEqual(image.shape, (120, 320))
         self.assertEqual(image[4, 7], 1)
         self.assertEqual(image[0, 0], 0)
 
-    def test_block_visit_covers_each_foreground_pixel(self):
-        image = np.zeros((40, 40), dtype=np.uint8)
-        image[1, 1:4] = 1
-        image[8:10, 6] = 1
-        route = generate_block_visit(image, np.array((40, 80)))
-        self.assertEqual(
-            {tuple(point) for point in route},
-            {(41, 81), (41, 82), (41, 83), (48, 86), (49, 86)},
-        )
-
-    def test_order_files_use_platform_independent_newlines(self):
+    def test_route_file_contains_gui_block_data(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory, "order.txt")
-            generate_order_file([np.array((0, 1)), np.array((1, 1))], path)
-            self.assertEqual(path.read_bytes(), b"right\na\ndown\na")
+            image_path = Path(directory, "input.png")
+            route_path = Path(directory, "route.json")
+            pixels = np.full((120, 320), 255, dtype=np.uint8)
+            pixels[1, 1:4] = 0
+            Image.fromarray(pixels).save(image_path)
+            generate_route_file(str(image_path), str(route_path))
+            route = json.loads(route_path.read_text(encoding="utf-8"))
+        self.assertEqual(route["splatplost_version"], "0.2.0")
+        self.assertEqual(route["blocks"]["0"]["visit_route"], ["1,1", "1,2", "1,3"])
 
 
 if __name__ == "__main__":

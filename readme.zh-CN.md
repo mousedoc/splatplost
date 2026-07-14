@@ -10,13 +10,7 @@ Splatplost 是一个基于 [libnxctrl](https://github.com/Victrid/libnxctrl) 的
 
 Splatplost 现在支持 Windows 和 Linux。图像规划可以在两个平台上运行。Windows 绘图需要兼容的 Splatplost USB 串口适配器，或者连接到 Linux 上运行的远程 `libnxctrl` 服务。Windows 不能直接使用基于 BlueZ 的 `nxbt` 蓝牙后端，普通 USB 数据线也不能替代控制器模拟适配器。
 
-Windows 用户可以从 GitHub Actions 下载 `splatplost-windows-x64` 构建产物，解压后直接运行：
-
-```powershell
-.\splatplan.exe -i .\image.png -o .\order.txt
-.\splatplot.exe --list-ports
-.\splatplot.exe --backend usb --serial-port COM3 --order .\order.txt
-```
+Windows 用户可以从 GitHub Actions 下载 `splatplost-windows-x64` 构建产物，解压后双击 `splatplost.exe` 启动图形界面，无需安装 Python。在界面中选择图片、生成路径，然后选择 USB 或 Remote 后端连接 Switch。
 
 从源码安装 Windows 版本：
 
@@ -40,31 +34,13 @@ sudo python3 -m pip install ".[bluetooth]"
 
 ### 使用
 
-生成一个绘图计划：
+启动图形界面：
 
 ```bash
-splatplan -i <你的图像> -o <输出文件名>
+sudo splatplost
 ```
 
-启动绘图器：
-
-```bash
-sudo splatplot --backend nxbt --order <输出文件名>
-```
-
-查看绘图器的选项（例如稳定模式，自定义延迟和按键时间，等等）：
-
-```bash
-sudo splatplot --help
-```
-
-当屏幕上显示 "Open the pairing menu on switch. " 时，进入 NS 的配对菜单，虚拟手柄将自动与 NS 配对。
-
-然后用自己的手柄进入斯普拉遁投稿界面，并将笔刷设为最小。
-
-准备完成后，断开自己的手柄，（可以按下手柄顶部的小配对按钮），NS 将提示 “请在需要使用的手柄上按下 L + R 键”。
-
-按照指示按回车键或 "A" 键，绘图将开始，程序将会显示打印进度和预计完成时间。
+在图形界面中选择一张 320 x 120 图片并点击 **Load** 生成路径。选择斯普拉遁版本和控制器后端，再点击 **Connect to Switch** 并按照配对对话框操作。选择需要处理的图像区块后，点击 **Draw selected** 或 **Erase selected**。
 
 ## 需要帮助/遇到问题/功能请求
 

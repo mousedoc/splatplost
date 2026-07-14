@@ -17,26 +17,7 @@ Windows cannot use the BlueZ-only `nxbt` backend directly. The USB backend requi
 
 #### Windows executable
 
-Download the `splatplost-windows-x64` artifact from a GitHub Actions run and extract it. No Python installation is needed.
-
-Generate a plotting plan:
-
-```powershell
-.\splatplan.exe -i .\image.png -o .\order.txt
-```
-
-List serial ports and print through a USB adapter:
-
-```powershell
-.\splatplot.exe --list-ports
-.\splatplot.exe --backend usb --serial-port COM3 --order .\order.txt
-```
-
-Alternatively, connect to a Linux machine running the `libnxctrl` server:
-
-```powershell
-.\splatplot.exe --backend remote --remote-server http://192.168.1.10:15973 --order .\order.txt
-```
+Download the `splatplost-windows-x64` artifact from a GitHub Actions run and extract it. Double-click `splatplost.exe` to start the GUI; no Python installation is needed. Choose an image in the GUI, generate its route, select the USB or Remote backend, and connect to the Switch.
 
 #### Install from source on Windows
 
@@ -62,31 +43,13 @@ If you need to update the library, you can use `pip install --upgrade splatplost
 
 ### Use
 
-Generate a plotting plan with:
+Start the GUI:
 
 ```bash
-splatplan -i <your image> -o <output filename>
+sudo splatplost
 ```
 
-Start the printer:
-
-```bash
-sudo splatplot --backend nxbt --order <output filename>
-```
-
-You may check the printer's option (for example, stable mode, customizing delay and press time, etc.) with:
-
-```bash
-sudo splatplot --help
-```
-
-When "Open the pairing menu on switch." shows on the screen, go to the pairing menu, and the switch will be paired.
-
-Then you may enter the game and enter splatpost interface using your own controller. Remember to set the brush to minimum one.
-
-When everything is prepaired, disconnect your own controller, (for example, press the tiny pairing button on the top of the controller), and you'll enter the "connect to controller" menu.
-
-Press enter or "A" button on your computer as instructed, the plotting will begin. You may see the progress and ETA time while printing.
+In the GUI, select a 320 x 120 image and click **Load** to generate the route. Choose the Splatoon version and controller backend, then click **Connect to Switch** and follow the pairing dialog. Select the image blocks you want to process and use **Draw selected** or **Erase selected**.
 
 ## Help needed / I found a bug / Feature request
 

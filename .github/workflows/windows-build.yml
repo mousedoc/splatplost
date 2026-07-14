@@ -1,8 +1,8 @@
-name: Build Windows executables
+name: Build Windows GUI executable
 
 on:
   push:
-    branches: [master, main]
+    tags: ["*"]
   pull_request:
   workflow_dispatch:
   release:
@@ -31,33 +31,28 @@ jobs:
       - name: Run tests
         run: python -m unittest discover -s tests -v
 
-      - name: Build splatplan.exe
+      - name: Build splatplost.exe
         run: >-
-          pyinstaller --noconfirm --clean --onefile
-          --name splatplan
-          packaging/splatplan_entry.py
-
-      - name: Build splatplot.exe
-        run: >-
-          pyinstaller --noconfirm --clean --onefile
-          --name splatplot
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name splatplost
+          --add-data "splatplost/gui/*.ui;splatplost"
           --hidden-import libnxctrl.splatplost_USB
           --hidden-import libnxctrl.rpc
           --hidden-import serial.tools.list_ports
-          packaging/splatplot_entry.py
+          packaging/splatplost_entry.py
 
-      - name: Smoke-test executables
+      - name: Smoke-test GUI executable
         shell: pwsh
         run: |
-          .\dist\splatplan.exe --version
-          .\dist\splatplot.exe --help
-          .\dist\splatplot.exe --list-ports
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $process = Start-Process -FilePath ".\dist\splatplost.exe" -ArgumentList "--smoke-test" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "GUI smoke test failed with exit code $($process.ExitCode)" }
 
       - name: Create release archive
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path package | Out-Null
-          Copy-Item dist\splatplan.exe, dist\splatplot.exe, readme.md, LICENSE package
+          Copy-Item dist\splatplost.exe, readme.md, LICENSE package
           Compress-Archive -Path package\* -DestinationPath splatplost-windows-x64.zip
 
       - name: Upload Windows artifact
