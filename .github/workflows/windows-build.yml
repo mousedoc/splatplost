@@ -1,4 +1,4 @@
-name: Build Windows GUI executable
+name: Build Windows release
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build-windows:
-    runs-on: windows-latest
+    runs-on: windows-2022
 
     steps:
       - name: Check out repository
@@ -46,11 +46,31 @@ jobs:
           $process = Start-Process -FilePath ".\dist\splatplost.exe" -ArgumentList "--smoke-test" -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "GUI smoke test failed with exit code $($process.ExitCode)" }
 
+      - name: Verify Windows Driver Kit
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $driverKit = & $vswhere -latest -products * -requires Component.Microsoft.Windows.DriverKit -property installationPath
+          if (-not $driverKit) {
+            throw "The Visual Studio Driver Kit component is missing from this runner."
+          }
+          $wdkBin = "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.0.26100.0"
+          if (-not (Test-Path $wdkBin)) {
+            throw "WDK 26100 is missing from this runner."
+          }
+
+      - name: Build native Windows Bluetooth driver
+        shell: pwsh
+        run: |
+          ./native/windows_bluetooth/build-driver.ps1 -Configuration Release -Platform x64
+          ./native/windows_bluetooth/sign-test-driver.ps1 -PackageDirectory ./native/windows_bluetooth/out
+
       - name: Stage Windows artifact
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path package | Out-Null
           Copy-Item dist\splatplost.exe, readme.md, LICENSE package
+          Copy-Item native\windows_bluetooth\out\* package
           Compress-Archive -Path package\* -DestinationPath splatplost-windows-x64.zip -Force
 
       - name: Upload Windows artifact

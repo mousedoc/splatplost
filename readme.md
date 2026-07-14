@@ -4,7 +4,7 @@
 
 Splatplost is a GUI application that converts a 320 × 120 image into controller input for drawing a Splatoon post. It is built on [libnxctrl](https://github.com/Victrid/libnxctrl) and provides an optimized route generator, block-based drawing controls, and multiple controller backends.
 
-This repository contains the PyQt6 v0.2 GUI and a Windows x64 port. The Windows build is distributed as a single windowed executable and does not require a local Python installation.
+This repository contains the PyQt6 GUI and a Windows x64 port. The Windows build does not require a local Python installation.
 
 ## Features
 
@@ -14,6 +14,7 @@ This repository contains the PyQt6 v0.2 GUI and a Windows x64 port. The Windows 
 - Optimized drawing-route generation
 - Selectable image blocks for partial drawing or erasing
 - Optional canvas clearing, calibration control, and stable mode
+- Native Windows Bluetooth controller emulation without a VM or external controller board
 - Windows support through Splatplost USB and Remote backends
 - Linux Bluetooth support through the optional `nxbt` backend
 - Automated Windows builds and GitHub Releases for pushed tags
@@ -25,10 +26,18 @@ This repository contains the PyQt6 v0.2 GUI and a Windows x64 port. The Windows 
 3. Extract the ZIP into a new folder.
 4. Double-click `splatplost.exe`.
 
-The release ZIP contains:
+The release ZIP contains the application plus the native Bluetooth driver package:
 
 ```text
 splatplost.exe
+SplatplostBluetooth.sys
+SplatplostBluetooth.inf
+SplatplostBluetooth.cat
+SplatplostBluetoothService.exe
+SplatplostDevelopment.cer
+install-driver.ps1
+uninstall-driver.ps1
+THIRD_PARTY_NOTICES.md
 readme.md
 LICENSE
 ```
@@ -52,11 +61,25 @@ Use **Load an Empty Image** when you only need erasing operations. The drawing o
 
 | Backend          | Windows | Linux | Notes                                                                                                                      |
 | ---------------- | ------- | ----- | -------------------------------------------------------------------------------------------------------------------------- |
+| Windows Bluetooth| Yes     | No    | Uses the PC Bluetooth radio directly. Requires the included profile driver and a restart after installation.               |
 | Splatplost USB   | Yes     | Yes   | Requires a compatible USB serial controller-emulation device and its serial driver. A regular USB cable is not sufficient. |
 | Remote           | Yes     | Yes   | Connects to a compatible remote `libnxctrl` server, typically running on Linux.                                            |
 | `nxbt` Bluetooth | No      | Yes   | Linux-only because it depends on BlueZ. It may require elevated Bluetooth permissions.                                     |
 
-Windows does not support the BlueZ-based `nxbt` backend directly. On Windows, use a compatible Splatplost USB device or the Remote backend.
+Windows does not support the BlueZ-based `nxbt` backend directly. The `Windows Bluetooth` backend implements the same Switch controller protocol over the Windows Bluetooth driver stack.
+
+### Native Windows Bluetooth setup
+
+The Actions artifact currently contains a development-signed driver. Windows can load it only in test-signing mode, which also requires Secure Boot to be disabled. A normal Secure Boot installation requires the same driver package to be signed by Microsoft through Hardware Dev Center attestation or WHQL signing.
+
+1. Extract the complete release ZIP.
+2. Open PowerShell as Administrator in the extracted folder.
+3. For a development build, run `./install-driver.ps1 -EnableTestSigning`, restart Windows, then run `./install-driver.ps1` once more. Do not change Secure Boot automatically; the script stops and explains when a Microsoft-signed package is required.
+4. Restart Windows after installation.
+5. Open the Switch **Controllers > Change Grip/Order** screen.
+6. Start Splatplost, select **Windows Bluetooth**, and click **Start Pairing**.
+
+Installation temporarily changes the Windows Bluetooth Class of Device to Peripheral/Gamepad so the Switch can discover the PC as a controller. `uninstall-driver.ps1` disables the local profile and restores the values that were present before installation.
 
 ## Install from Source
 
@@ -105,28 +128,31 @@ The test suite covers Windows GUI initialization, backend loading, image convers
 
 ### Publishing a Windows Release
 
-The workflow in `.github/workflows/windows-build.yml` runs only when a tag is pushed. It:
+The workflow in `.github/workflows/windows-build.yml` can be started manually or by pushing a tag. It:
 
 1. installs the project on a Windows runner;
 2. runs the test suite;
 3. builds the windowed one-file `splatplost.exe`;
 4. smoke-tests the packaged GUI;
-5. uploads the Windows Actions artifact; and
-6. publishes `splatplost-windows-x64.zip` to a GitHub Release for the tag.
+5. builds and test-signs the native Windows Bluetooth profile driver;
+6. uploads the Windows Actions artifact; and
+7. publishes `splatplost-windows-x64.zip` to a GitHub Release for the tag.
 
 Create and push a new tag after the workflow change is present on the target commit:
 
 ```powershell
-git tag v0.2.1
-git push origin v0.2.1
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
 ## Troubleshooting
 
 - **A console appears and reports that `--order` is required:** you downloaded the old v0.1 CLI artifact. Download a current Release containing only `splatplost.exe`.
 - **No COM port appears for Splatplost USB:** connect a compatible controller-emulation device and install its serial driver. A normal USB cable cannot provide this backend.
+- **The Windows Bluetooth driver is not installed:** keep all release files together and run `install-driver.ps1` from an Administrator PowerShell window, then restart Windows.
+- **Secure Boot blocks the development driver:** development certificates are intentionally not trusted by Secure Boot. Use a Microsoft-attestation-signed release package; disabling Secure Boot is only appropriate on a dedicated development machine.
 - **Remote pairing reports an XML-RPC protocol error:** enter the address of a running `libnxctrl` remote server. Host names and IP addresses without a scheme are treated as `http://`; Remote does not connect directly to the Switch IP address.
-- **`nxbt` is not listed on Windows:** this is expected. Use Splatplost USB or Remote instead.
+- **`nxbt` is not listed on Windows:** this is expected. Select **Windows Bluetooth** for the native backend; Splatplost USB and Remote remain optional alternatives.
 - **The image will not load:** resize or crop it to exactly 320 × 120 pixels and save it as PNG or JPEG.
 
 ## Issues and Contributing

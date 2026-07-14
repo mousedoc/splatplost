@@ -7,7 +7,7 @@ long_description = (this_directory / "readme.md").read_text(encoding="utf-8")
 
 setup(
         name='splatplost',
-        version='0.2.1',
+        version='0.3.0',
         packages=find_packages(),
         url='https://github.com/Victrid/splatplost',
         license='GPLv3',

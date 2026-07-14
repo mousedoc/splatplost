@@ -66,6 +66,16 @@ class SplatplostUSBConfigWidget(Form_SUSB):
             }
 
 
+class WindowsBluetoothConfigWidget(Form_nxbt):
+    """Timing options for the native Windows Bluetooth backend."""
+
+    def get_connection_args(self):
+        return {
+            "press_duration_ms": int(self.press_ms.value()),
+            "delay_ms": int(self.delay_ms.value()),
+            }
+
+
 class RemoteConfigWidget(Form_Remote):
     def get_connection_args(self):
         return {

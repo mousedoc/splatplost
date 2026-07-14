@@ -1,0 +1,52 @@
+[Version]
+Signature="$WINDOWS NT$"
+Class=Bluetooth
+ClassGuid={e0cbf06c-cd8b-4647-bb8a-263b43f0f974}
+Provider=%ProviderString%
+DriverVer=07/14/2026,0.3.0.0
+CatalogFile=SplatplostBluetooth.cat
+PnpLockdown=1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskId1%,,,""
+
+[SourceDisksFiles]
+SplatplostBluetooth.sys = 1,,
+
+[Manufacturer]
+%ManufacturerString%=Splatplost,NT$ARCH$.10.0
+
+[Splatplost.NT$ARCH$.10.0]
+%DeviceDesc%=Driver_Install,BTHENUM\{f6fd1f11-2d8a-4ce4-8794-261e461e6c53}
+
+[Driver_Install.NT]
+CopyFiles=DriverStore_Dir
+
+[DriverStore_Dir]
+SplatplostBluetooth.sys
+
+[Driver_Install.NT.Services]
+AddService=SplatplostBluetooth,0x00000002,Service_Install
+
+[Service_Install]
+DisplayName=%ServiceDesc%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%13%\SplatplostBluetooth.sys
+
+[Driver_Install.NT.Wdf]
+KmdfService=SplatplostBluetooth,Wdf_Install
+
+[Wdf_Install]
+KmdfLibraryVersion=$KMDFVERSION$
+
+[Strings]
+ProviderString="Splatplost"
+ManufacturerString="Splatplost"
+DiskId1="Splatplost Bluetooth installation disk"
+DeviceDesc="Splatplost Bluetooth Controller"
+ServiceDesc="Splatplost Bluetooth Controller"

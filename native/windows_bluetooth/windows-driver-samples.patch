@@ -1,0 +1,789 @@
+diff --git a/bluetooth/bthecho/bthsrv/sys/BthEchoSampleSrv.vcxproj b/bluetooth/bthecho/bthsrv/sys/BthEchoSampleSrv.vcxproj
+index bf1902a..7e18af3 100644
+--- a/bluetooth/bthecho/bthsrv/sys/BthEchoSampleSrv.vcxproj
++++ b/bluetooth/bthecho/bthsrv/sys/BthEchoSampleSrv.vcxproj
+@@ -76,7 +76,7 @@
+     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" />
+   </ImportGroup>
+   <ItemGroup Label="WrappedTaskItems">
+-    <ClCompile Include="sdp.c; server.c; driver.c; device.c; echo.c">
++    <ClCompile Include="sdp.c; server.c; driver.c; device.c; echo.c; bridge.c">
+       <WppEnabled>true</WppEnabled>
+       <WppKernelMode>true</WppKernelMode>
+       <WppTraceFunction>TraceEvents(LEVEL,FLAGS,MSG,...)</WppTraceFunction>
+@@ -84,16 +84,16 @@
+     </ClCompile>
+   </ItemGroup>
+   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+-    <TargetName>BthEchoSampleSrv</TargetName>
++    <TargetName>SplatplostBluetooth</TargetName>
+   </PropertyGroup>
+   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
+-    <TargetName>BthEchoSampleSrv</TargetName>
++    <TargetName>SplatplostBluetooth</TargetName>
+   </PropertyGroup>
+   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+-    <TargetName>BthEchoSampleSrv</TargetName>
++    <TargetName>SplatplostBluetooth</TargetName>
+   </PropertyGroup>
+   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">
+-    <TargetName>BthEchoSampleSrv</TargetName>
++    <TargetName>SplatplostBluetooth</TargetName>
+   </PropertyGroup>
+   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+     <ClCompile>
+@@ -204,4 +204,4 @@
+     <ClInclude Exclude="@(ClInclude)" Include="*.h;*.hpp;*.hxx;*.hm;*.inl;*.xsd" />
+   </ItemGroup>
+   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+-</Project>
+\ No newline at end of file
++</Project>
+diff --git a/bluetooth/bthecho/bthsrv/sys/bridge.c b/bluetooth/bthecho/bthsrv/sys/bridge.c
+new file mode 100644
+index 0000000..628c881
+--- /dev/null
++++ b/bluetooth/bthecho/bthsrv/sys/bridge.c
+@@ -0,0 +1,251 @@
++#include "clisrv.h"
++#include "device.h"
++#include "echo.h"
++#include "bridge.h"
++
++#define SPLATPLOST_MAX_REPORT_SIZE 64
++
++NTSTATUS
++SplatplostBridgeInitialize(
++    _In_ WDFDEVICE Device
++    )
++{
++    NTSTATUS status;
++    WDF_IO_QUEUE_CONFIG queueConfig;
++    WDF_OBJECT_ATTRIBUTES attributes;
++    UNICODE_STRING symbolicLink;
++    PBTHECHOSAMPLE_SERVER_CONTEXT devCtx = GetServerDeviceContext(Device);
++
++    RtlInitUnicodeString(&symbolicLink, L"\\DosDevices\\SplatplostBluetooth");
++    status = WdfDeviceCreateSymbolicLink(Device, &symbolicLink);
++    if (!NT_SUCCESS(status)) {
++        return status;
++    }
++
++    WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(
++        &queueConfig,
++        WdfIoQueueDispatchParallel
++        );
++    queueConfig.EvtIoRead = SplatplostEvtIoRead;
++    queueConfig.EvtIoWrite = SplatplostEvtIoWrite;
++    queueConfig.EvtIoDeviceControl = SplatplostEvtIoDeviceControl;
++
++    status = WdfIoQueueCreate(
++        Device,
++        &queueConfig,
++        WDF_NO_OBJECT_ATTRIBUTES,
++        WDF_NO_HANDLE
++        );
++    if (!NT_SUCCESS(status)) {
++        return status;
++    }
++
++    WDF_IO_QUEUE_CONFIG_INIT(&queueConfig, WdfIoQueueDispatchManual);
++    WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
++    attributes.ParentObject = Device;
++
++    return WdfIoQueueCreate(
++        Device,
++        &queueConfig,
++        &attributes,
++        &devCtx->PendingReads
++        );
++}
++
++VOID
++SplatplostEvtIoRead(
++    _In_ WDFQUEUE Queue,
++    _In_ WDFREQUEST Request,
++    _In_ size_t Length
++    )
++{
++    NTSTATUS status;
++    PBTHECHOSAMPLE_SERVER_CONTEXT devCtx =
++        GetServerDeviceContext(WdfIoQueueGetDevice(Queue));
++
++    if (Length < SPLATPLOST_MAX_REPORT_SIZE) {
++        WdfRequestComplete(Request, STATUS_BUFFER_TOO_SMALL);
++        return;
++    }
++
++    status = WdfRequestForwardToIoQueue(Request, devCtx->PendingReads);
++    if (!NT_SUCCESS(status)) {
++        WdfRequestComplete(Request, status);
++    }
++}
++
++VOID
++SplatplostEvtIoWrite(
++    _In_ WDFQUEUE Queue,
++    _In_ WDFREQUEST Request,
++    _In_ size_t Length
++    )
++{
++    NTSTATUS status;
++    PVOID input = NULL;
++    WDFOBJECT connectionObject = NULL;
++    PBTHECHO_CONNECTION connection = NULL;
++    PBTHECHOSAMPLE_SERVER_CONTEXT devCtx =
++        GetServerDeviceContext(WdfIoQueueGetDevice(Queue));
++
++    if (Length == 0 || Length > SPLATPLOST_MAX_REPORT_SIZE) {
++        WdfRequestComplete(Request, STATUS_INVALID_BUFFER_SIZE);
++        return;
++    }
++
++    status = WdfRequestRetrieveInputBuffer(Request, Length, &input, NULL);
++    if (!NT_SUCCESS(status)) {
++        WdfRequestComplete(Request, status);
++        return;
++    }
++
++    WdfSpinLockAcquire(devCtx->ConnectionListLock);
++    connectionObject = devCtx->InterruptConnection;
++    if (connectionObject != NULL) {
++        WdfObjectReference(connectionObject);
++    }
++    WdfSpinLockRelease(devCtx->ConnectionListLock);
++
++    if (connectionObject == NULL) {
++        WdfRequestComplete(Request, STATUS_DEVICE_NOT_CONNECTED);
++        return;
++    }
++
++    connection = GetConnectionObjectContext(connectionObject);
++    BthEchoSrvSendEcho(&devCtx->Header, connection, input, Length);
++    WdfObjectDereference(connectionObject);
++    WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, Length);
++}
++
++VOID
++SplatplostEvtIoDeviceControl(
++    _In_ WDFQUEUE Queue,
++    _In_ WDFREQUEST Request,
++    _In_ size_t OutputBufferLength,
++    _In_ size_t InputBufferLength,
++    _In_ ULONG IoControlCode
++    )
++{
++    NTSTATUS status;
++    PSPLATPLOST_STATUS output = NULL;
++    PBTHECHOSAMPLE_SERVER_CONTEXT devCtx =
++        GetServerDeviceContext(WdfIoQueueGetDevice(Queue));
++
++    UNREFERENCED_PARAMETER(InputBufferLength);
++
++    if (IoControlCode != IOCTL_SPLATPLOST_GET_STATUS) {
++        WdfRequestComplete(Request, STATUS_INVALID_DEVICE_REQUEST);
++        return;
++    }
++
++    if (OutputBufferLength < sizeof(*output)) {
++        WdfRequestComplete(Request, STATUS_BUFFER_TOO_SMALL);
++        return;
++    }
++
++    status = WdfRequestRetrieveOutputBuffer(
++        Request,
++        sizeof(*output),
++        (PVOID *)&output,
++        NULL
++        );
++    if (!NT_SUCCESS(status)) {
++        WdfRequestComplete(Request, status);
++        return;
++    }
++
++    RtlZeroMemory(output, sizeof(*output));
++    WdfSpinLockAcquire(devCtx->ConnectionListLock);
++    if (devCtx->ControlConnection != NULL) {
++        output->ConnectedChannels |= 0x01;
++    }
++    if (devCtx->InterruptConnection != NULL) {
++        output->ConnectedChannels |= 0x02;
++    }
++    output->LocalAddress = devCtx->Header.LocalBthAddr;
++    WdfSpinLockRelease(devCtx->ConnectionListLock);
++
++    WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(*output));
++}
++
++_IRQL_requires_max_(DISPATCH_LEVEL)
++VOID
++SplatplostBridgeConnectionAdded(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
++    _In_ PBTHECHO_CONNECTION Connection
++    )
++{
++    WDFOBJECT object = WdfObjectContextGetObject(Connection);
++
++    WdfSpinLockAcquire(DevCtx->ConnectionListLock);
++    if (Connection->Psm == SPLATPLOST_CONTROL_PSM) {
++        DevCtx->ControlConnection = object;
++    } else if (Connection->Psm == SPLATPLOST_INTERRUPT_PSM) {
++        DevCtx->InterruptConnection = object;
++    }
++    WdfSpinLockRelease(DevCtx->ConnectionListLock);
++}
++
++_IRQL_requires_max_(DISPATCH_LEVEL)
++VOID
++SplatplostBridgeConnectionRemoved(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
++    _In_ PBTHECHO_CONNECTION Connection
++    )
++{
++    WDFOBJECT object = WdfObjectContextGetObject(Connection);
++
++    WdfSpinLockAcquire(DevCtx->ConnectionListLock);
++    if (DevCtx->ControlConnection == object) {
++        DevCtx->ControlConnection = NULL;
++    }
++    if (DevCtx->InterruptConnection == object) {
++        DevCtx->InterruptConnection = NULL;
++    }
++    WdfSpinLockRelease(DevCtx->ConnectionListLock);
++}
++
++_IRQL_requires_max_(DISPATCH_LEVEL)
++VOID
++SplatplostBridgePacketReceived(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
++    _In_ PBTHECHO_CONNECTION Connection,
++    _In_reads_bytes_(BufferLength) PVOID Buffer,
++    _In_ size_t BufferLength
++    )
++{
++    NTSTATUS status;
++    WDFREQUEST request = NULL;
++    PVOID output = NULL;
++    WDFOBJECT object = WdfObjectContextGetObject(Connection);
++
++    if (BufferLength == 0 || BufferLength > SPLATPLOST_MAX_REPORT_SIZE) {
++        return;
++    }
++
++    WdfSpinLockAcquire(DevCtx->ConnectionListLock);
++    if (DevCtx->InterruptConnection != object) {
++        WdfSpinLockRelease(DevCtx->ConnectionListLock);
++        return;
++    }
++    WdfSpinLockRelease(DevCtx->ConnectionListLock);
++
++    status = WdfIoQueueRetrieveNextRequest(DevCtx->PendingReads, &request);
++    if (!NT_SUCCESS(status)) {
++        return;
++    }
++
++    status = WdfRequestRetrieveOutputBuffer(
++        request,
++        BufferLength,
++        &output,
++        NULL
++        );
++    if (!NT_SUCCESS(status)) {
++        WdfRequestComplete(request, status);
++        return;
++    }
++
++    RtlCopyMemory(output, Buffer, BufferLength);
++    WdfRequestCompleteWithInformation(request, STATUS_SUCCESS, BufferLength);
++}
+diff --git a/bluetooth/bthecho/bthsrv/sys/bridge.h b/bluetooth/bthecho/bthsrv/sys/bridge.h
+new file mode 100644
+index 0000000..8a3d24e
+--- /dev/null
++++ b/bluetooth/bthecho/bthsrv/sys/bridge.h
+@@ -0,0 +1,44 @@
++#pragma once
++
++#define SPLATPLOST_CONTROL_PSM   0x0011
++#define SPLATPLOST_INTERRUPT_PSM 0x0013
++#define IOCTL_SPLATPLOST_GET_STATUS \
++    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
++
++typedef struct _SPLATPLOST_STATUS {
++    ULONG ConnectedChannels;
++    ULONG Reserved;
++    BTH_ADDR LocalAddress;
++} SPLATPLOST_STATUS, *PSPLATPLOST_STATUS;
++
++NTSTATUS
++SplatplostBridgeInitialize(
++    _In_ WDFDEVICE Device
++    );
++
++_IRQL_requires_max_(DISPATCH_LEVEL)
++VOID
++SplatplostBridgeConnectionAdded(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
++    _In_ PBTHECHO_CONNECTION Connection
++    );
++
++_IRQL_requires_max_(DISPATCH_LEVEL)
++VOID
++SplatplostBridgeConnectionRemoved(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
++    _In_ PBTHECHO_CONNECTION Connection
++    );
++
++_IRQL_requires_max_(DISPATCH_LEVEL)
++VOID
++SplatplostBridgePacketReceived(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
++    _In_ PBTHECHO_CONNECTION Connection,
++    _In_reads_bytes_(BufferLength) PVOID Buffer,
++    _In_ size_t BufferLength
++    );
++
++EVT_WDF_IO_QUEUE_IO_READ SplatplostEvtIoRead;
++EVT_WDF_IO_QUEUE_IO_WRITE SplatplostEvtIoWrite;
++EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL SplatplostEvtIoDeviceControl;
+diff --git a/bluetooth/bthecho/bthsrv/sys/device.c b/bluetooth/bthecho/bthsrv/sys/device.c
+index f06dc2b..60042c7 100644
+--- a/bluetooth/bthecho/bthsrv/sys/device.c
++++ b/bluetooth/bthecho/bthsrv/sys/device.c
+@@ -27,6 +27,8 @@ Environment:
+ #include "server.h"
+ #include "sdp.h"
+ #include "echo.h"
++#include "bridge.h"
++#include "switch_sdp.h"
+ 
+ #define INITGUID
+ #include "public.h"
+@@ -69,6 +71,10 @@ Return Value:
+     WDFDEVICE                       device;    
+     WDF_OBJECT_ATTRIBUTES           attributes;
+     WDF_PNPPOWER_EVENT_CALLBACKS    pnpPowerCallbacks;
++    DECLARE_CONST_UNICODE_STRING(
++        deviceSddl,
++        L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;BU)"
++        );
+     
+     UNREFERENCED_PARAMETER(Driver);
+ 
+@@ -86,6 +92,14 @@ Return Value:
+         &pnpPowerCallbacks
+         );
+ 
++    WdfDeviceInitSetIoType(DeviceInit, WdfDeviceIoBuffered);
++    WdfDeviceInitSetExclusive(DeviceInit, TRUE);
++    status = WdfDeviceInitAssignSDDLString(DeviceInit, &deviceSddl);
++    if (!NT_SUCCESS(status))
++    {
++        goto exit;
++    }
++
+     //
+     // Create device object with context
+     //
+@@ -115,6 +129,12 @@ Return Value:
+         goto exit;       
+     }
+ 
++    status = SplatplostBridgeInitialize(device);
++    if (!NT_SUCCESS(status))
++    {
++        goto exit;
++    }
++
+     //
+     // Query for interfaces and pre-allocate BRBs
+     //
+@@ -160,10 +180,6 @@ Return Value:
+ {
+     NTSTATUS status;
+     PBTHECHOSAMPLE_SERVER_CONTEXT devCtx = GetServerDeviceContext(Device);
+-    PUCHAR sdpRecordStream = NULL;
+-    ULONG sdpRecordLength = 0;
+-    BTHDDI_SDP_NODE_INTERFACE sdpNodeInterface;
+-    BTHDDI_SDP_PARSE_INTERFACE sdpParseInterface;
+ 
+     status = BthEchoSharedRetrieveLocalInfo(&devCtx->Header);
+     if (!NT_SUCCESS(status))
+@@ -183,71 +199,17 @@ Return Value:
+         goto exit;
+     }
+ 
+-    status = WdfFdoQueryForInterface(
+-        Device,
+-        &GUID_BTHDDI_SDP_PARSE_INTERFACE, 
+-        (PINTERFACE) (&sdpParseInterface),
+-        sizeof(sdpParseInterface), 
+-        BTHDDI_SDP_PARSE_INTERFACE_VERSION_FOR_QI, 
+-        NULL
+-        );
+-                
+-    if (!NT_SUCCESS(status))
+-    {
+-        TraceEvents(TRACE_LEVEL_ERROR, DBG_PNP, 
+-            "QueryInterface failed for Interface sdp parse interface, version %d, Status code %!STATUS!\n", 
+-            BTHDDI_SDP_PARSE_INTERFACE_VERSION_FOR_QI,
+-            status);
+-
+-        goto exit;
+-    }
+-
+-    status = WdfFdoQueryForInterface(
+-        Device,
+-        &GUID_BTHDDI_SDP_NODE_INTERFACE, 
+-        (PINTERFACE) (&sdpNodeInterface),
+-        sizeof(sdpNodeInterface), 
+-        BTHDDI_SDP_NODE_INTERFACE_VERSION_FOR_QI, 
+-        NULL
++    status = BthEchoSrvPublishSdpRecord(
++        devCtx,
++        g_SwitchSdpRecord,
++        g_SwitchSdpRecordLength
+         );
+-                
+-    if (!NT_SUCCESS(status))
+-    {
+-        TraceEvents(TRACE_LEVEL_ERROR, DBG_PNP, 
+-            "QueryInterface failed for Interface sdp node interface, version %d, Status code %!STATUS!\n", 
+-            BTHDDI_SDP_NODE_INTERFACE_VERSION_FOR_QI,
+-            status);
+-
+-        goto exit;
+-    }
+-
+-    status = CreateSdpRecord(
+-        &sdpNodeInterface,
+-        &sdpParseInterface,
+-        &BTHECHOSAMPLE_SVC_GUID,
+-        BthEchoSampleSvcName,
+-        devCtx->Psm,
+-        &sdpRecordStream,
+-        &sdpRecordLength
+-        );                                                
+-    if (!NT_SUCCESS(status))
+-    {
+-        goto exit;
+-    }
+-    
+-    status = BthEchoSrvPublishSdpRecord(devCtx, sdpRecordStream, sdpRecordLength);
+     if (!NT_SUCCESS(status))
+     {
+         goto exit;
+     }
+     
+ exit:
+-
+-    if (sdpRecordStream)
+-    {
+-        FreeSdpRecord(sdpRecordStream);
+-    }
+-    
+     return status;    
+ }    
+ 
+@@ -290,10 +252,7 @@ Return Value:
+         BthEchoSrvUnregisterL2CAPServer(devCtx);
+     }
+ 
+-    if (0 != devCtx->Psm)
+-    {
+-        BthEchoSrvUnregisterPSM(devCtx);
+-    }
++    BthEchoSrvUnregisterPSM(devCtx);
+ 
+     //
+     // Disconnect any open connections, after this point no more
+@@ -334,8 +293,8 @@ Arguments:
+ 
+ --*/
+ {
+-    BthEchoSrvSendEcho(
+-        DevCtxHdr,
++    SplatplostBridgePacketReceived(
++        (PBTHECHOSAMPLE_SERVER_CONTEXT)DevCtxHdr,
+         Connection,
+         Buffer,
+         BufferLength
+@@ -407,12 +366,21 @@ Arguments:
+         goto exit;
+     }
+ 
++    SplatplostBridgeConnectionAdded(
++        (PBTHECHOSAMPLE_SERVER_CONTEXT)connection->DevCtxHdr,
++        connection
++        );
++
+     status = BthEchoConnectionObjectContinuousReaderSubmitReaders(
+         connection
+         );
+ 
+     if (!NT_SUCCESS(status))
+     {
++        SplatplostBridgeConnectionRemoved(
++            (PBTHECHOSAMPLE_SERVER_CONTEXT)connection->DevCtxHdr,
++            connection
++            );
+         goto exit;
+     }
+     
+diff --git a/bluetooth/bthecho/bthsrv/sys/device.h b/bluetooth/bthecho/bthsrv/sys/device.h
+index 9fdf54c..819d64e 100644
+--- a/bluetooth/bthecho/bthsrv/sys/device.h
++++ b/bluetooth/bthecho/bthsrv/sys/device.h
+@@ -10,7 +10,8 @@ typedef struct _BTHECHOSAMPLE_SERVER_CONTEXT
+     //
+     // Our Data PSM
+     //    
+-    USHORT Psm;
++    USHORT Psms[2];
++    BOOLEAN PsmRegistered[2];
+ 
+     //
+     // Handle to published SDP record
+@@ -40,6 +41,13 @@ typedef struct _BTHECHOSAMPLE_SERVER_CONTEXT
+     // Outstanding open connections
+     //
+     LIST_ENTRY ConnectionList;
++
++    //
++    // User-mode bridge state. Access is protected by ConnectionListLock.
++    //
++    WDFOBJECT ControlConnection;
++    WDFOBJECT InterruptConnection;
++    WDFQUEUE PendingReads;
+     
+ } BTHECHOSAMPLE_SERVER_CONTEXT, *PBTHECHOSAMPLE_SERVER_CONTEXT;
+ 
+@@ -74,6 +82,8 @@ BthEchoSampleServerContextInit(
+     }
+ 
+     InitializeListHead(&Context->ConnectionList);
++    Context->Psms[0] = 0x0011;
++    Context->Psms[1] = 0x0013;
+ 
+ exit:
+     return status;
+diff --git a/bluetooth/bthecho/bthsrv/sys/server.c b/bluetooth/bthecho/bthsrv/sys/server.c
+index b1cee49..0e7bb2f 100644
+--- a/bluetooth/bthecho/bthsrv/sys/server.c
++++ b/bluetooth/bthecho/bthsrv/sys/server.c
+@@ -25,6 +25,7 @@ Environment:
+ #include "clisrv.h"
+ #include "device.h"
+ #include "server.h"
++#include "bridge.h"
+ 
+ #if defined(EVENT_TRACING)
+ #include "server.tmh"
+@@ -340,40 +341,39 @@ Return Value:
+ 
+ --*/
+ {
+-    NTSTATUS status;
++    NTSTATUS status = STATUS_SUCCESS;
+     struct _BRB_PSM * brb;
++    ULONG index;
+ 
+-    DevCtx->Header.ProfileDrvInterface.BthReuseBrb(
+-        &(DevCtx->RegisterUnregisterBrb), 
+-        BRB_REGISTER_PSM
+-        );
++    for (index = 0; index < RTL_NUMBER_OF(DevCtx->Psms); index++)
++    {
++        DevCtx->Header.ProfileDrvInterface.BthReuseBrb(
++            &(DevCtx->RegisterUnregisterBrb),
++            BRB_REGISTER_PSM
++            );
+ 
+-    brb = (struct _BRB_PSM *)
+-            &(DevCtx->RegisterUnregisterBrb);
+-    
+-    //
+-    // Send in our preferred PSM
+-    //
+-    brb->Psm = DevCtx->Psm;
++        brb = (struct _BRB_PSM *)&(DevCtx->RegisterUnregisterBrb);
++        brb->Psm = DevCtx->Psms[index];
+ 
+-    status = BthEchoSharedSendBrbSynchronously(
+-        DevCtx->Header.IoTarget,
+-        DevCtx->Header.Request,
+-        (PBRB) brb,
+-        sizeof(*brb)
+-        );
+-    
+-    if (!NT_SUCCESS(status))
+-    {
+-        TraceEvents(TRACE_LEVEL_ERROR, DBG_PNP, 
+-            "BRB_REGISTER_PSM failed, Status code %!STATUS!\n", status);
+-        goto exit;        
+-    }
++        status = BthEchoSharedSendBrbSynchronously(
++            DevCtx->Header.IoTarget,
++            DevCtx->Header.Request,
++            (PBRB)brb,
++            sizeof(*brb)
++            );
+ 
+-    //
+-    // Store PSM obtained
+-    //
+-    DevCtx->Psm = brb->Psm;
++        if (!NT_SUCCESS(status) || brb->Psm != DevCtx->Psms[index])
++        {
++            if (NT_SUCCESS(status))
++            {
++                status = STATUS_DEVICE_PROTOCOL_ERROR;
++            }
++            BthEchoSrvUnregisterPSM(DevCtx);
++            goto exit;
++        }
++
++        DevCtx->PsmRegistered[index] = TRUE;
++    }
+ 
+ exit:
+     return status;
+@@ -402,50 +402,38 @@ Return Value:
+ {
+     NTSTATUS status;
+     struct _BRB_PSM * brb;
++    LONG index;
+ 
+     PAGED_CODE();
+ 
+-    if (0 == DevCtx->Psm)
++    for (index = RTL_NUMBER_OF(DevCtx->Psms) - 1; index >= 0; index--)
+     {
+-        return;
+-    }
+-
+-    DevCtx->Header.ProfileDrvInterface.BthReuseBrb(
+-        &(DevCtx->RegisterUnregisterBrb), 
+-        BRB_UNREGISTER_PSM
+-        );
+-
+-    brb = (struct _BRB_PSM *)
+-            &(DevCtx->RegisterUnregisterBrb);
++        if (!DevCtx->PsmRegistered[index])
++        {
++            continue;
++        }
+ 
+-    //
+-    // Format Brb
+-    //
+-    
+-    brb->Psm = DevCtx->Psm;
++        DevCtx->Header.ProfileDrvInterface.BthReuseBrb(
++            &(DevCtx->RegisterUnregisterBrb),
++            BRB_UNREGISTER_PSM
++            );
+ 
+-    status = BthEchoSharedSendBrbSynchronously(
+-        DevCtx->Header.IoTarget,
+-        DevCtx->Header.Request,
+-        (PBRB) brb,
+-        sizeof(*(brb))
+-        );
++        brb = (struct _BRB_PSM *)&(DevCtx->RegisterUnregisterBrb);
++        brb->Psm = DevCtx->Psms[index];
+ 
+-    if (!NT_SUCCESS(status))
+-    {
+-        TraceEvents(TRACE_LEVEL_ERROR, DBG_PNP, 
+-            "BRB_UNREGISTER_PSM failed, Status code %!STATUS!\n", status);
++        status = BthEchoSharedSendBrbSynchronously(
++            DevCtx->Header.IoTarget,
++            DevCtx->Header.Request,
++            (PBRB)brb,
++            sizeof(*brb)
++            );
+ 
+-        //
+-        // Send does not fail for resource reasons
+-        //
+-        NT_ASSERT(FALSE);
+-        
+-        goto exit;        
++        NT_ASSERT(NT_SUCCESS(status));
++        if (NT_SUCCESS(status))
++        {
++            DevCtx->PsmRegistered[index] = FALSE;
++        }
+     }
+-
+-exit:
+-    return;
+ }
+ 
+ _IRQL_requires_max_(PASSIVE_LEVEL)
+@@ -796,6 +784,7 @@ Return Value:
+         connection->InMTU = brb->InResults.Params.Mtu;
+         connection->ChannelHandle = brb->ChannelHandle;
+         connection->RemoteAddress = brb->BtAddress;
++        connection->Psm = brb->Psm;
+ 
+         TraceEvents(TRACE_LEVEL_INFORMATION, DBG_CONNECT, 
+             "Connection (0x%x) established with client", brb->OutResults.Params.RetransmissionAndFlow.Mode); 
+@@ -1106,6 +1095,7 @@ Return Value:
+         connection->InMTU = brb->InResults.Params.Mtu;
+         connection->ChannelHandle = brb->ChannelHandle;
+         connection->RemoteAddress = brb->BtAddress;
++        connection->Psm = brb->Psm;
+ 
+         TraceEvents(TRACE_LEVEL_INFORMATION, DBG_CONNECT, 
+             "Connection established with client"); 
+@@ -1364,6 +1354,11 @@ Arguments:
+ {
+     WDFOBJECT connectionObject;
+ 
++    SplatplostBridgeConnectionRemoved(
++        (PBTHECHOSAMPLE_SERVER_CONTEXT)Connection->DevCtxHdr,
++        Connection
++        );
++
+     //
+     // If BthEchoConnectionObjectRemoteDisconnect returns FALSE
+     // connection is already disconnected
+@@ -1447,6 +1442,7 @@ Arguments:
+         // If client disconnects in the meantime connection state tracking ensures
+         // that we send disconnect only once
+         //
++        SplatplostBridgeConnectionRemoved(DevCtx, connection);
+         BthEchoConnectionObjectRemoteDisconnect(&DevCtx->Header, connection);
+ 
+         //
+diff --git a/bluetooth/bthecho/common/inc/connection.h b/bluetooth/bthecho/common/inc/connection.h
+index fd34d26..b826b9f 100644
+--- a/bluetooth/bthecho/common/inc/connection.h
++++ b/bluetooth/bthecho/common/inc/connection.h
+@@ -135,6 +135,7 @@ typedef struct _BTHECHO_CONNECTION {
+ 
+     L2CAP_CHANNEL_HANDLE                    ChannelHandle;
+     BTH_ADDR                                RemoteAddress;
++    USHORT                                  Psm;
+ 
+     //
+     // Preallocated Brb, Request used for connect/disconnect
+diff --git a/bluetooth/bthecho/common/inc/public.h b/bluetooth/bthecho/common/inc/public.h
+index 825078d..5793e0c 100644
+--- a/bluetooth/bthecho/common/inc/public.h
++++ b/bluetooth/bthecho/common/inc/public.h
+@@ -24,9 +24,9 @@ Abstract:
+ // Service GUID and name for the service published by our bth server device
+ //
+ 
+-/* c07508f2-b970-43ca-b5dd-cc4f2391bef4 */
+-DEFINE_GUID(BTHECHOSAMPLE_SVC_GUID, 0xc07508f2, 0xb970, 0x43ca, 0xb5, 0xdd, 0xcc, 0x4f, 0x23, 0x91, 0xbe, 0xf4);
+-extern __declspec(selectany) const PWSTR BthEchoSampleSvcName = L"BthEchoSampleSrv";
++/* f6fd1f11-2d8a-4ce4-8794-261e461e6c53 */
++DEFINE_GUID(BTHECHOSAMPLE_SVC_GUID, 0xf6fd1f11, 0x2d8a, 0x4ce4, 0x87, 0x94, 0x26, 0x1e, 0x46, 0x1e, 0x6c, 0x53);
++extern __declspec(selectany) const PWSTR BthEchoSampleSvcName = L"Pro Controller";
+ 
+ //
+ // Device interface exposed by our bth client device

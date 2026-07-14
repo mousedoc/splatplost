@@ -25,6 +25,16 @@ from splatplost.route_handler import RouteFile
 from splatplost.version import __version__
 
 
+WINDOWS_BLUETOOTH_BACKEND = "Windows Bluetooth"
+
+
+def available_backends() -> list[str]:
+    backends = list(get_available_backend())
+    if sys.platform == "win32" and WINDOWS_BLUETOOTH_BACKEND not in backends:
+        backends.insert(0, WINDOWS_BLUETOOTH_BACKEND)
+    return backends
+
+
 class WorkerSignals(QObject):
     finish: pyqtSignal = pyqtSignal()
     error: pyqtSignal = pyqtSignal(Exception)
@@ -112,7 +122,11 @@ class PlotterUI(Form_plotter):
 
         def pairing():
             try:
-                backend = get_backend(backend_name=backend_type)
+                if backend_type == WINDOWS_BLUETOOTH_BACKEND:
+                    from splatplost.windows_bluetooth import WindowsBluetoothControl
+                    backend = WindowsBluetoothControl
+                else:
+                    backend = get_backend(backend_name=backend_type)
                 connection = backend(**parameters)
                 connection.connect()
                 self.connection = connection
@@ -388,7 +402,7 @@ class PlotterUI(Form_plotter):
         self.language_zhTW.triggered.connect(partial(self.language_clicked, "zh_TW"))
 
         # Init available backend
-        self.backend_selector.addItems(get_available_backend())
+        self.backend_selector.addItems(available_backends())
         self.backend_selector.setCurrentIndex(-1)
 
         # Press

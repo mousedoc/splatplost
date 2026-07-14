@@ -8,7 +8,12 @@
 from PyQt6 import uic
 from PyQt6.QtWidgets import QApplication
 
-from splatplost.gui.backend_config import NxbtConfigWidget, RemoteConfigWidget, SplatplostUSBConfigWidget
+from splatplost.gui.backend_config import (
+    NxbtConfigWidget,
+    RemoteConfigWidget,
+    SplatplostUSBConfigWidget,
+    WindowsBluetoothConfigWidget,
+)
 from splatplost.gui.bugreport_ui import spawn_error_dialog
 from splatplost.gui.bundler import ui_path
 
@@ -22,7 +27,9 @@ class ConnectToSwitchUI(Form_ConnectToSwitch):
         self.parent_dialog = None
         self.parent = parent
         self.backend = backend
-        if backend == "nxbt":
+        if backend == "Windows Bluetooth":
+            self.config_widget_ = WindowsBluetoothConfigWidget()
+        elif backend == "nxbt":
             self.config_widget_ = NxbtConfigWidget()
         elif backend == "Splatplost USB":
             self.config_widget_ = SplatplostUSBConfigWidget()

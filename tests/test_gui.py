@@ -6,7 +6,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6 import QtWidgets
 
 from splatplost.gui.backend_config import normalize_remote_server_address
-from splatplost.gui.plotter import PlotterUI
+from splatplost.gui.plotter import PlotterUI, available_backends
 
 
 class GuiTests(unittest.TestCase):
@@ -24,6 +24,12 @@ class GuiTests(unittest.TestCase):
         self.assertTrue(form.windowTitle())
         form.close()
         window.tempdir.cleanup()
+
+    def test_native_bluetooth_is_available_on_windows(self):
+        from unittest.mock import patch
+
+        with patch("splatplost.gui.plotter.sys.platform", "win32"):
+            self.assertEqual(available_backends()[0], "Windows Bluetooth")
 
     def test_remote_server_address_adds_default_protocol(self):
         self.assertEqual(
