@@ -176,6 +176,7 @@ if ($null -eq $device) {
 
 $driverService = (Get-PnpDeviceProperty -InstanceId $device.InstanceId -KeyName "DEVPKEY_Device_Service" -ErrorAction SilentlyContinue).Data
 $problemCode = (Get-PnpDeviceProperty -InstanceId $device.InstanceId -KeyName "DEVPKEY_Device_ProblemCode" -ErrorAction SilentlyContinue).Data
+$problemStatus = (Get-PnpDeviceProperty -InstanceId $device.InstanceId -KeyName "DEVPKEY_Device_ProblemStatus" -ErrorAction SilentlyContinue).Data
 if ($driverService -ne "SplatplostBluetooth") {
     throw "Windows did not bind the Splatplost driver to the Bluetooth profile device (active service: '$driverService')."
 }
@@ -184,7 +185,8 @@ if ($null -ne $problemCode -and [int]$problemCode -ne 0 -and [int]$problemCode -
     if ([int]$problemCode -eq 52) {
         throw "Windows blocked the development driver signature (Device Manager code 52). Confirm that Secure Boot is off, test-signing mode is active, and Windows was restarted."
     }
-    throw "The Splatplost Bluetooth driver could not start (Device Manager problem code $problemCode, status $($device.Status))."
+    $problemStatusText = if ($null -eq $problemStatus) { "unknown" } else { "0x{0:X8}" -f [uint32]$problemStatus }
+    throw "The Splatplost Bluetooth driver could not start (Device Manager problem code $problemCode, NTSTATUS $problemStatusText, status $($device.Status))."
 }
 if ([int]$problemCode -eq 14) {
     $restartRequired = $true
