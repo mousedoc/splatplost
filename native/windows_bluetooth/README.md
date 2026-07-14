@@ -9,6 +9,7 @@ This directory builds a Windows KMDF Bluetooth profile driver that makes the PC 
 - `generate_switch_sdp.py` serializes the SDP XML into the static record submitted by the Windows Bluetooth stack.
 - `build-driver.ps1` checks out the pinned Microsoft sample commit, applies the patch, and builds the x64 driver plus local-service helper.
 - `install-driver.ps1` stages the driver, enables the local profile, and saves/replaces the host Class of Device with Peripheral/Gamepad values.
+- `install-driver.cmd` and `uninstall-driver.cmd` launch the PowerShell installers with a process-scoped execution-policy bypass.
 - `uninstall-driver.ps1` disables the profile and restores the previous Class of Device values.
 
 The upstream sample is pinned to commit `2ee527bfeb0aeb6be11f0a8b6dce4011b358ce89` so the patch and build are reproducible.

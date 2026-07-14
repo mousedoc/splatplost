@@ -36,7 +36,9 @@ SplatplostBluetooth.cat
 SplatplostBluetoothService.exe
 SplatplostDevelopment.cer
 install-driver.ps1
+install-driver.cmd
 uninstall-driver.ps1
+uninstall-driver.cmd
 THIRD_PARTY_NOTICES.md
 readme.md
 LICENSE
@@ -74,7 +76,7 @@ The Actions artifact currently contains a development-signed driver. Windows can
 
 1. Extract the complete release ZIP.
 2. Open PowerShell as Administrator in the extracted folder.
-3. For a development build, run `./install-driver.ps1 -EnableTestSigning`, restart Windows, then run `./install-driver.ps1` once more. Do not change Secure Boot automatically; the script stops and explains when a Microsoft-signed package is required.
+3. Open an Administrator PowerShell window and run `.\install-driver.cmd -EnableTestSigning`, restart Windows, then run `.\install-driver.cmd` once more. The CMD launcher bypasses PowerShell's script execution policy only for the installer process. It does not change the machine-wide execution policy.
 4. Restart Windows after installation.
 5. Open the Switch **Controllers > Change Grip/Order** screen.
 6. Start Splatplost, select **Windows Bluetooth**, and click **Start Pairing**.

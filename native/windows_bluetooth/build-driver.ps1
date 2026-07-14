@@ -46,7 +46,9 @@ Copy-Item -Force $driver.FullName (Join-Path $output "SplatplostBluetooth.sys")
 Copy-Item -Force $inf.FullName (Join-Path $output "SplatplostBluetooth.inf")
 Copy-Item -Force $installer.FullName (Join-Path $output "SplatplostBluetoothService.exe")
 Copy-Item -Force (Join-Path $PSScriptRoot "install-driver.ps1") $output
+Copy-Item -Force (Join-Path $PSScriptRoot "install-driver.cmd") $output
 Copy-Item -Force (Join-Path $PSScriptRoot "uninstall-driver.ps1") $output
+Copy-Item -Force (Join-Path $PSScriptRoot "uninstall-driver.cmd") $output
 Copy-Item -Force (Join-Path $PSScriptRoot "THIRD_PARTY_NOTICES.md") $output
 
 Write-Output $output
