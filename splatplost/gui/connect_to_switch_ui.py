@@ -34,10 +34,19 @@ class ConnectToSwitchUI(Form_ConnectToSwitch):
             raise RuntimeError("Backend error")
 
     def start_pairing_clicked(self):
+        try:
+            parameters = self.config_widget_.get_connection_args()
+        except (TypeError, ValueError) as err:
+            return spawn_error_dialog(
+                    err,
+                    QApplication.translate("@default", "Invalid connection settings"),
+                    reportable=False,
+                    )
+
         self.start_pairing.setEnabled(False)
         self.start_pairing.setText(QApplication.translate("@default", "Pairing..."))
         self.parent.start_pairing(backend_type=self.backend,
-                                  parameters=self.config_widget_.get_connection_args(),
+                                  parameters=parameters,
                                   success_callback=self.finished_pairing, fail_callback=self.error_pairing
                                   )
 

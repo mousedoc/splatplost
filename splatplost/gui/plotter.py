@@ -389,6 +389,7 @@ class PlotterUI(Form_plotter):
 
         # Init available backend
         self.backend_selector.addItems(get_available_backend())
+        self.backend_selector.setCurrentIndex(-1)
 
         # Press
         self.press_l.clicked.connect(self.press_shoulder_l)

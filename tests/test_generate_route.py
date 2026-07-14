@@ -7,6 +7,7 @@ import numpy as np
 from PIL import Image
 
 from splatplost.generate_route import generate_route_file, get_label, load_images, manhattan_distance
+from splatplost.version import __version__
 
 
 class GenerateRouteTests(unittest.TestCase):
@@ -39,7 +40,7 @@ class GenerateRouteTests(unittest.TestCase):
             Image.fromarray(pixels).save(image_path)
             generate_route_file(str(image_path), str(route_path))
             route = json.loads(route_path.read_text(encoding="utf-8"))
-        self.assertEqual(route["splatplost_version"], "0.2.0")
+        self.assertEqual(route["splatplost_version"], __version__)
         self.assertEqual(route["blocks"]["0"]["visit_route"], ["1,1", "1,2", "1,3"])
 
 

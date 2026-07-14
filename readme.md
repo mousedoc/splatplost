@@ -125,6 +125,7 @@ git push origin v0.2.1
 
 - **A console appears and reports that `--order` is required:** you downloaded the old v0.1 CLI artifact. Download a current Release containing only `splatplost.exe`.
 - **No COM port appears for Splatplost USB:** connect a compatible controller-emulation device and install its serial driver. A normal USB cable cannot provide this backend.
+- **Remote pairing reports an XML-RPC protocol error:** enter the address of a running `libnxctrl` remote server. Host names and IP addresses without a scheme are treated as `http://`; Remote does not connect directly to the Switch IP address.
 - **`nxbt` is not listed on Windows:** this is expected. Use Splatplost USB or Remote instead.
 - **The image will not load:** resize or crop it to exactly 320 × 120 pixels and save it as PNG or JPEG.
 

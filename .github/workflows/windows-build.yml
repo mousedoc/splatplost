@@ -31,6 +31,7 @@ jobs:
         run: >-
           pyinstaller --noconfirm --clean --onefile --windowed
           --name splatplost
+          --paths .
           --add-data "splatplost/gui/*.ui;splatplost"
           --hidden-import libnxctrl.splatplost_USB
           --hidden-import libnxctrl.rpc
