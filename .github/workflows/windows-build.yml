@@ -3,6 +3,7 @@ name: Build Windows GUI executable
 on:
   push:
     tags: ["*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -61,6 +62,7 @@ jobs:
           retention-days: 90
 
       - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
