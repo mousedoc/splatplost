@@ -1,9 +1,14 @@
 # 설치방법
 
+### 메모리 무결성 해제
+<img width="535" height="316" alt="image" src="https://github.com/user-attachments/assets/14e4211e-987c-4501-bda0-4722cd0b8895" />
+- **설치가 끝난 뒤 반드시 메모리 무결성을 다시 활성화 해주세요**
+- Windows 보안 -> 장치 보안 -> 코어 격리 -> 메모리 무결성
+
+
 ### Secure Boot 해제
 - **설치가 끝난 뒤 반드시 Secure Boot를 다시 활성화 해주세요**
 - https://www.asus.com/kr/support/faq/1049829/
-
 
 
 ### 드라이버 설치
