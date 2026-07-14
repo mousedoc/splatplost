@@ -3,13 +3,9 @@ name: Build Windows GUI executable
 on:
   push:
     tags: ["*"]
-  pull_request:
-  workflow_dispatch:
-  release:
-    types: [published]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build-windows:
@@ -53,6 +49,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path package | Out-Null
           Copy-Item dist\splatplost.exe, readme.md, LICENSE package
+          Compress-Archive -Path package\* -DestinationPath splatplost-windows-x64.zip -Force
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
@@ -61,3 +58,13 @@ jobs:
           path: package/*
           if-no-files-found: error
           retention-days: 90
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$env:GITHUB_REF_NAME"
+          "splatplost-windows-x64.zip#Windows x64"
+          --verify-tag
+          --generate-notes
