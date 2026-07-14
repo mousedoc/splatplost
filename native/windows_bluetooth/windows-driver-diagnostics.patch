@@ -1,0 +1,115 @@
+diff --git a/bluetooth/bthecho/bthsrv/sys/bridge.c b/bluetooth/bthecho/bthsrv/sys/bridge.c
+index 628c881..ac2af62 100644
+--- a/bluetooth/bthecho/bthsrv/sys/bridge.c
++++ b/bluetooth/bthecho/bthsrv/sys/bridge.c
+@@ -162,6 +162,8 @@ SplatplostEvtIoDeviceControl(
+     if (devCtx->InterruptConnection != NULL) {
+         output->ConnectedChannels |= 0x02;
+     }
++    output->ConnectedChannels |= devCtx->InitializationStage << 16;
++    output->InitializationStatus = devCtx->InitializationStatus;
+     output->LocalAddress = devCtx->Header.LocalBthAddr;
+     WdfSpinLockRelease(devCtx->ConnectionListLock);
+ 
+diff --git a/bluetooth/bthecho/bthsrv/sys/bridge.h b/bluetooth/bthecho/bthsrv/sys/bridge.h
+index 8a3d24e..1b09a8b 100644
+--- a/bluetooth/bthecho/bthsrv/sys/bridge.h
++++ b/bluetooth/bthecho/bthsrv/sys/bridge.h
+@@ -2,12 +2,17 @@
+ 
+ #define SPLATPLOST_CONTROL_PSM   0x0011
+ #define SPLATPLOST_INTERRUPT_PSM 0x0013
++#define SPLATPLOST_INIT_STAGE_LOCAL_INFO       1
++#define SPLATPLOST_INIT_STAGE_PSM              2
++#define SPLATPLOST_INIT_STAGE_L2CAP_SERVER     3
++#define SPLATPLOST_INIT_STAGE_SDP              4
++#define SPLATPLOST_INIT_STAGE_READY            5
+ #define IOCTL_SPLATPLOST_GET_STATUS \
+     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
+ 
+ typedef struct _SPLATPLOST_STATUS {
+     ULONG ConnectedChannels;
+-    ULONG Reserved;
++    NTSTATUS InitializationStatus;
+     BTH_ADDR LocalAddress;
+ } SPLATPLOST_STATUS, *PSPLATPLOST_STATUS;
+ 
+diff --git a/bluetooth/bthecho/bthsrv/sys/device.c b/bluetooth/bthecho/bthsrv/sys/device.c
+index 876e559..2eb1648 100644
+--- a/bluetooth/bthecho/bthsrv/sys/device.c
++++ b/bluetooth/bthecho/bthsrv/sys/device.c
+@@ -186,24 +186,28 @@ Return Value:
+     NTSTATUS status;
+     PBTHECHOSAMPLE_SERVER_CONTEXT devCtx = GetServerDeviceContext(Device);
+ 
++    devCtx->InitializationStage = SPLATPLOST_INIT_STAGE_LOCAL_INFO;
+     status = BthEchoSharedRetrieveLocalInfo(&devCtx->Header);
+     if (!NT_SUCCESS(status))
+     {
+-        goto exit;
++        goto failed;
+     }
+ 
++    devCtx->InitializationStage = SPLATPLOST_INIT_STAGE_PSM;
+     status = BthEchoSrvRegisterPSM(devCtx);
+     if (!NT_SUCCESS(status))
+     {
+-        goto exit;
++        goto failed;
+     }
+ 
++    devCtx->InitializationStage = SPLATPLOST_INIT_STAGE_L2CAP_SERVER;
+     status = BthEchoSrvRegisterL2CAPServer(devCtx);
+     if (!NT_SUCCESS(status))
+     {
+-        goto exit;
++        goto failed;
+     }
+ 
++    devCtx->InitializationStage = SPLATPLOST_INIT_STAGE_SDP;
+     status = BthEchoSrvPublishSdpRecord(
+         devCtx,
+         g_SwitchSdpRecord,
+@@ -211,11 +215,16 @@ Return Value:
+         );
+     if (!NT_SUCCESS(status))
+     {
+-        goto exit;
++        goto failed;
+     }
+-    
+-exit:
+-    return status;    
++
++    devCtx->InitializationStage = SPLATPLOST_INIT_STAGE_READY;
++    devCtx->InitializationStatus = STATUS_SUCCESS;
++    return STATUS_SUCCESS;
++
++failed:
++    devCtx->InitializationStatus = status;
++    return STATUS_SUCCESS;
+ }    
+ 
+ VOID
+diff --git a/bluetooth/bthecho/bthsrv/sys/device.h b/bluetooth/bthecho/bthsrv/sys/device.h
+index 819d64e..ad3ffac 100644
+--- a/bluetooth/bthecho/bthsrv/sys/device.h
++++ b/bluetooth/bthecho/bthsrv/sys/device.h
+@@ -48,6 +48,8 @@ typedef struct _BTHECHOSAMPLE_SERVER_CONTEXT
+     WDFOBJECT ControlConnection;
+     WDFOBJECT InterruptConnection;
+     WDFQUEUE PendingReads;
++    NTSTATUS InitializationStatus;
++    ULONG InitializationStage;
+     
+ } BTHECHOSAMPLE_SERVER_CONTEXT, *PBTHECHOSAMPLE_SERVER_CONTEXT;
+ 
+@@ -84,6 +86,8 @@ BthEchoSampleServerContextInit(
+     InitializeListHead(&Context->ConnectionList);
+     Context->Psms[0] = 0x0011;
+     Context->Psms[1] = 0x0013;
++    Context->InitializationStatus = STATUS_DEVICE_NOT_READY;
++    Context->InitializationStage = 0;
+ 
+ exit:
+     return status;

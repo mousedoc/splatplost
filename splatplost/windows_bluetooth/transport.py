@@ -18,6 +18,31 @@ def _ctl_code(device_type: int, function: int, method: int = 0, access: int = 0)
 
 
 IOCTL_SPLATPLOST_GET_STATUS = _ctl_code(0x22, 0x800)
+INITIALIZATION_STAGE_NAMES = {
+    1: "local Bluetooth radio query",
+    2: "HID PSM registration",
+    3: "L2CAP server registration",
+    4: "HID SDP record publication",
+}
+
+
+def _decode_status(data: bytes) -> tuple[int, str]:
+    channels_and_stage, initialization_status, address = struct.unpack_from(
+        "<IIQ", data
+    )
+    stage = channels_and_stage >> 16
+    if initialization_status & 0x80000000:
+        stage_name = INITIALIZATION_STAGE_NAMES.get(
+            stage, "unknown initialization stage"
+        )
+        raise OSError(
+            "Windows Bluetooth driver initialization failed during "
+            f"{stage_name} (stage {stage}, "
+            f"NTSTATUS 0x{initialization_status:08X})."
+        )
+    address_bytes = address.to_bytes(8, "little")[:6]
+    address_text = ":".join(f"{value:02X}" for value in reversed(address_bytes))
+    return channels_and_stage & 0xFFFF, address_text
 
 
 class WindowsBluetoothTransport:
@@ -92,10 +117,7 @@ class WindowsBluetoothTransport:
         )
         if not ok:
             raise ctypes.WinError(ctypes.get_last_error())
-        channels, _reserved, address = struct.unpack_from("<IIQ", output.raw)
-        address_bytes = address.to_bytes(8, "little")[:6]
-        address_text = ":".join(f"{value:02X}" for value in reversed(address_bytes))
-        return channels, address_text
+        return _decode_status(output.raw)
 
     def wait_connected(self, timeout: float = 180.0) -> str:
         deadline = time.monotonic() + timeout

@@ -28,6 +28,8 @@ git -C $destination reset --hard $sampleCommit
 git -C $destination clean -fd -- bluetooth/bthecho
 git -C $destination apply (Join-Path $PSScriptRoot "windows-driver-samples.patch")
 if ($LASTEXITCODE -ne 0) { throw "Unable to apply the Splatplost Bluetooth driver patch." }
+git -C $destination apply (Join-Path $PSScriptRoot "windows-driver-diagnostics.patch")
+if ($LASTEXITCODE -ne 0) { throw "Unable to apply the Splatplost Bluetooth diagnostics patch." }
 
 $serverSource = Join-Path $destination "bluetooth\bthecho\bthsrv\sys"
 Remove-Item -LiteralPath (Join-Path $serverSource "BthEchoSampleSrv.inx") -Force

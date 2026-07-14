@@ -1,11 +1,13 @@
 import threading
 import time
 import unittest
+import struct
 
 from libnxctrl.wrapper import Button
 
 from splatplost.windows_bluetooth.backend import WindowsBluetoothControl
 from splatplost.windows_bluetooth.protocol import SwitchProtocol
+from splatplost.windows_bluetooth.transport import _decode_status
 
 
 def switch_subcommand(command: int, payload: bytes = b"") -> bytes:
@@ -43,6 +45,20 @@ class ProtocolTests(unittest.TestCase):
         report = protocol.next_input_report()
         self.assertEqual(len(report), SwitchProtocol.REPORT_SIZE)
         self.assertEqual(report[20], 29)
+
+
+class TransportStatusTests(unittest.TestCase):
+    def test_decodes_ready_driver_status(self):
+        data = struct.pack("<IIQ", (5 << 16) | 0x03, 0, 0x0123456789AB)
+        self.assertEqual(_decode_status(data), (0x03, "01:23:45:67:89:AB"))
+
+    def test_reports_driver_initialization_stage_and_status(self):
+        data = struct.pack("<IIQ", 2 << 16, 0xC000000D, 0)
+        with self.assertRaisesRegex(
+            OSError,
+            r"HID PSM registration \(stage 2, NTSTATUS 0xC000000D\)",
+        ):
+            _decode_status(data)
 
 
 class FakeTransport:

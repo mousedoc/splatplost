@@ -5,6 +5,7 @@ This directory builds a Windows KMDF Bluetooth profile driver that makes the PC 
 ## Components
 
 - `windows-driver-samples.patch` adapts Microsoft's Bluetooth Echo L2CAP sample to register HID control PSM `0x11` and interrupt PSM `0x13` and expose a `\\.\SplatplostBluetooth` user-mode bridge.
+- `windows-driver-diagnostics.patch` keeps the bridge available when Bluetooth initialization fails so the installer and app can report the exact failing stage and NTSTATUS.
 - `switch-controller.xml` is the Pro Controller SDP/HID record used by NXBT.
 - `generate_switch_sdp.py` serializes the SDP XML into the static record submitted by the Windows Bluetooth stack.
 - `build-driver.ps1` checks out the pinned Microsoft sample commit, applies the patch, and builds the x64 driver plus local-service helper.

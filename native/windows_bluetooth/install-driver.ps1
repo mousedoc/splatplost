@@ -53,6 +53,17 @@ namespace Splatplost
         [DllImport("kernel32.dll")]
         private static extern bool CloseHandle(IntPtr handle);
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool DeviceIoControl(
+            IntPtr device,
+            uint ioControlCode,
+            IntPtr inputBuffer,
+            uint inputBufferLength,
+            [Out] byte[] outputBuffer,
+            uint outputBufferLength,
+            out uint bytesReturned,
+            IntPtr overlapped);
+
         public static bool IsTestSigningEnabled()
         {
             SystemCodeIntegrityInformation information = new SystemCodeIntegrityInformation();
@@ -66,15 +77,31 @@ namespace Splatplost
             return (information.CodeIntegrityOptions & 0x02) != 0;
         }
 
-        public static int ProbeBridge(string path)
+        public static int ProbeBridge(string path, out uint driverStatus, out uint driverStage)
         {
+            driverStatus = 0;
+            driverStage = 0;
             IntPtr handle = CreateFile(path, 0xC0000000, 0x00000003, IntPtr.Zero, 3, 0, IntPtr.Zero);
             if (handle == new IntPtr(-1))
             {
                 return Marshal.GetLastWin32Error();
             }
+
+            byte[] statusBuffer = new byte[16];
+            uint bytesReturned;
+            int result = 0;
+            if (!DeviceIoControl(handle, 0x00222000, IntPtr.Zero, 0, statusBuffer, (uint)statusBuffer.Length, out bytesReturned, IntPtr.Zero))
+            {
+                result = Marshal.GetLastWin32Error();
+            }
+            else if (bytesReturned >= 8)
+            {
+                uint channelsAndStage = BitConverter.ToUInt32(statusBuffer, 0);
+                driverStage = channelsAndStage >> 16;
+                driverStatus = BitConverter.ToUInt32(statusBuffer, 4);
+            }
             CloseHandle(handle);
-            return 0;
+            return result;
         }
     }
 }
@@ -192,11 +219,30 @@ if ([int]$problemCode -eq 14) {
     $restartRequired = $true
 }
 
-$bridgeError = [Splatplost.NativeStatus]::ProbeBridge($bridgePath)
+$driverInitializationStatus = [uint32]0
+$driverInitializationStage = [uint32]0
+$bridgeError = [Splatplost.NativeStatus]::ProbeBridge(
+    $bridgePath,
+    [ref]$driverInitializationStatus,
+    [ref]$driverInitializationStage
+)
 if ($bridgeError -eq 32) {
     Write-Host "The driver bridge is already open by another Splatplost process."
 } elseif ($bridgeError -ne 0 -and -not $restartRequired) {
     throw "The driver device started, but its application bridge is unavailable (Windows error $bridgeError)."
+}
+
+if (($driverInitializationStatus -band 0x80000000) -ne 0) {
+    $stageNames = @{
+        1 = "local Bluetooth radio query"
+        2 = "HID PSM registration"
+        3 = "L2CAP server registration"
+        4 = "HID SDP record publication"
+    }
+    $stageName = $stageNames[[int]$driverInitializationStage]
+    if (-not $stageName) { $stageName = "unknown initialization stage" }
+    $driverStatusText = "0x{0:X8}" -f $driverInitializationStatus
+    throw "The driver loaded, but Bluetooth initialization failed during $stageName (stage $driverInitializationStage, NTSTATUS $driverStatusText)."
 }
 
 if ($restartRequired -or $bridgeError -ne 0) {
