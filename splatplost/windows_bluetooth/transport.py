@@ -49,7 +49,10 @@ class WindowsBluetoothTransport:
             self.handle = None
             if error in (2, 3):
                 raise FileNotFoundError(
-                    "The Splatplost Windows Bluetooth driver is not installed."
+                    "The Splatplost Windows Bluetooth driver bridge is unavailable "
+                    f"(Windows error {error}). Re-run install-driver.ps1 as "
+                    "Administrator and restart Windows. The driver may be missing, "
+                    "blocked by signature enforcement, or waiting for a restart."
                 )
             raise ctypes.WinError(error)
         try:

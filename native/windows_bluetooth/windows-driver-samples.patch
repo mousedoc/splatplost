@@ -32,6 +32,68 @@ index bf1902a..5281bd5 100644
    </PropertyGroup>
    <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
      <ClCompile>
+diff --git a/bluetooth/bthecho/bthsrv/inst/main.cpp b/bluetooth/bthecho/bthsrv/inst/main.cpp
+index ab555b2..77d304f 100644
+--- a/bluetooth/bthecho/bthsrv/inst/main.cpp
++++ b/bluetooth/bthecho/bthsrv/inst/main.cpp
+@@ -50,13 +50,15 @@ SetBthServiceInfo(
+     BOOLEAN bEnabled
+     );
+ 
+-void
++int
+ __cdecl
+ wmain(
+     _In_ UINT nArgs,
+     _In_reads_(nArgs) LPCWSTR Args[]
+     )
+ {
++    DWORD result = ERROR_INVALID_PARAMETER;
++
+     if (nArgs < 2)
+     {
+         goto usage;
+@@ -64,30 +66,36 @@ wmain(
+ 
+     WCHAR Switch;
+ 
+-    if (ERROR_SUCCESS != ReadSwitch(Args[1], &Switch))
++    result = ReadSwitch(Args[1], &Switch);
++    if (ERROR_SUCCESS != result)
+     {
+         goto exit;
+     }
+ 
+     if (FALSE == AdjustProcessPrivileges())
+     {
++        result = GetLastError();
++        if (ERROR_SUCCESS == result)
++        {
++            result = ERROR_PRIVILEGE_NOT_HELD;
++        }
+         goto exit;
+     }
+ 
+     switch(Switch)
+     {
+         case L'i':
+-            SetBthServiceInfo(TRUE);
++            result = SetBthServiceInfo(TRUE);
+             break;
+         case L'u':
+-            SetBthServiceInfo(FALSE);
++            result = SetBthServiceInfo(FALSE);
+             break;
+         default:
+             goto usage;
+     }    
+     
+ exit:
+-    return;
++    return (int)result;
+     
+ usage:
+     printf("Usage: bthsrvinst [/i | /u]\n");
 diff --git a/bluetooth/bthecho/bthsrv/sys/bridge.c b/bluetooth/bthecho/bthsrv/sys/bridge.c
 new file mode 100644
 index 0000000..628c881
