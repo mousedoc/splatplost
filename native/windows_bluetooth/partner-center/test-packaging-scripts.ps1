@@ -315,14 +315,57 @@ $assembleScript = Join-Path $PSScriptRoot "assemble-signed-release.ps1"
 $pathSafetyScript = Join-Path $PSScriptRoot "path-safety.ps1"
 $driverRoot = Split-Path -Parent $PSScriptRoot
 $buildScript = Join-Path $driverRoot "build-driver.ps1"
+$signTestScript = Join-Path $driverRoot "sign-test-driver.ps1"
 $repositoryRoot = Split-Path -Parent (Split-Path -Parent $driverRoot)
 
 Invoke-Test "PowerShell scripts parse without errors" {
-    foreach ($scriptPath in @($prepareScript, $verifyScript, $assembleScript, $pathSafetyScript, $buildScript, $PSCommandPath)) {
+    foreach ($scriptPath in @($prepareScript, $verifyScript, $assembleScript, $pathSafetyScript, $buildScript, $signTestScript, $PSCommandPath)) {
         $tokens = $null
         $parseErrors = $null
         [Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors) | Out-Null
         Assert-True ($parseErrors.Count -eq 0) "$scriptPath has parser errors: $($parseErrors -join '; ')"
+    }
+}
+
+Invoke-Test "development signing repins the build manifest after catalog signing" {
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile($signTestScript, [ref]$tokens, [ref]$parseErrors)
+    Assert-True ($parseErrors.Count -eq 0) "Development signing script could not be parsed for the manifest regression test."
+    $functionAst = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq "Set-SplatplostDevelopmentManifestIdentity"
+    }, $true)
+    Assert-True ($null -ne $functionAst) "Development manifest identity updater was not found."
+    . ([ScriptBlock]::Create($functionAst.Extent.Text))
+
+    $root = Join-Path ([IO.Path]::GetTempPath()) ("splatplost-development-manifest-test-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force -Path $root | Out-Null
+    try {
+        $driver = Join-Path $root "SplatplostBluetooth.sys"
+        $manifestPath = Join-Path $root "SplatplostBluetooth-build-manifest.json"
+        Set-Content -LiteralPath $driver -Value "signed development driver" -NoNewline
+        $document = [PSCustomObject]@{
+            schemaVersion = 1
+            files = @([PSCustomObject]@{
+                name = "SplatplostBluetooth.sys"
+                sha256 = ("0" * 64)
+            })
+        }
+        $document | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+        $state = [PSCustomObject]@{ Path = $manifestPath; Document = $document }
+        Set-SplatplostDevelopmentManifestIdentity -ManifestState $state -SignedDriverPath $driver
+        $published = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+        $expectedHash = (Get-FileHash -LiteralPath $driver -Algorithm SHA256).Hash.ToLowerInvariant()
+        Assert-True ([string]$published.files[0].sha256 -ceq $expectedHash) "The signed SYS identity was not published atomically."
+
+        $source = Get-Content -LiteralPath $signTestScript -Raw
+        $catalogSigned = $source.IndexOf('throw "The test catalog signing step failed."')
+        $manifestUpdated = $source.LastIndexOf('Set-SplatplostDevelopmentManifestIdentity')
+        Assert-True ($catalogSigned -ge 0 -and $catalogSigned -lt $manifestUpdated) "The manifest is repinned before catalog signing succeeds."
+    } finally {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -1076,10 +1119,21 @@ if (-not $DevelopmentPackageDirectory) {
         Invoke-Test "provided catalog rejects a changed SYS" {
             $mutated = Join-Path $temporaryRoot "mutated"
             New-Item -ItemType Directory -Force -Path $mutated | Out-Null
-            foreach ($name in @("SplatplostBluetooth.inf", "SplatplostBluetooth.cat")) {
+            foreach ($name in @(
+                "SplatplostBluetooth.inf",
+                "SplatplostBluetooth.cat",
+                "SplatplostBluetooth-build-manifest.json"
+            )) {
                 Copy-Item -LiteralPath (Join-Path $package $name) -Destination (Join-Path $mutated $name)
             }
             Copy-Item -LiteralPath (Join-Path $repositoryRoot "readme.md") -Destination (Join-Path $mutated "SplatplostBluetooth.sys")
+            $mutatedManifestPath = Join-Path $mutated "SplatplostBluetooth-build-manifest.json"
+            $mutatedManifest = Get-Content -LiteralPath $mutatedManifestPath -Raw | ConvertFrom-Json
+            $mutatedSysEntries = @($mutatedManifest.files | Where-Object { [string]$_.name -ceq "SplatplostBluetooth.sys" })
+            Assert-True ($mutatedSysEntries.Count -eq 1) "Mutated package fixture has no unique SYS identity."
+            $mutatedSysEntries[0].sha256 = `
+                (Get-FileHash -LiteralPath (Join-Path $mutated "SplatplostBluetooth.sys") -Algorithm SHA256).Hash.ToLowerInvariant()
+            $mutatedManifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $mutatedManifestPath -Encoding UTF8
             $mutatedParameters = @{
                 PackageDirectory = $mutated
                 SymbolsPath = $symbols
