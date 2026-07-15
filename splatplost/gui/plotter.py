@@ -1,5 +1,7 @@
+import argparse
 import sys
 import tempfile
+import threading
 from functools import partial
 from pathlib import Path
 from typing import Optional
@@ -68,6 +70,12 @@ class PlotterUI(Form_plotter):
         self.tempdir = tempfile.TemporaryDirectory(prefix="splatplost")
         self.RouteFile = None
         self.connection: Optional[NXWrapper] = None
+        self._pending_connection: Optional[NXWrapper] = None
+        self._connection_lock = threading.RLock()
+        self._shutting_down = False
+        self._pairing_generation = 0
+        self._pairing_cancel_event: Optional[threading.Event] = None
+        self._unconfirmed_connection: Optional[NXWrapper] = None
         self.thread_pool: QThreadPool = QThreadPool()
         self.app = app
         self.form = form
@@ -120,19 +128,57 @@ class PlotterUI(Form_plotter):
             self.connection.disconnect()
             self.connection = None
 
+        with self._connection_lock:
+            self._pairing_generation += 1
+            pairing_generation = self._pairing_generation
+            pairing_cancel_event = threading.Event()
+            self._pairing_cancel_event = pairing_cancel_event
+            self._unconfirmed_connection = None
+
         def pairing():
+            connection = None
             try:
+                if pairing_cancel_event.is_set():
+                    raise ConnectionAbortedError("Pairing was cancelled.")
                 if backend_type == WINDOWS_BLUETOOTH_BACKEND:
                     from splatplost.windows_bluetooth import WindowsBluetoothControl
                     backend = WindowsBluetoothControl
                 else:
                     backend = get_backend(backend_name=backend_type)
                 connection = backend(**parameters)
+                with self._connection_lock:
+                    if (
+                        self._shutting_down
+                        or pairing_cancel_event.is_set()
+                        or pairing_generation != self._pairing_generation
+                    ):
+                        raise ConnectionAbortedError("Pairing was cancelled during shutdown.")
+                    self._pending_connection = connection
                 connection.connect()
-                self.connection = connection
-            except Exception as e:
-                self.connection = None
-                raise e
+                with self._connection_lock:
+                    if (
+                        self._shutting_down
+                        or pairing_cancel_event.is_set()
+                        or pairing_generation != self._pairing_generation
+                    ):
+                        raise ConnectionAbortedError("Pairing was cancelled during shutdown.")
+                    self.connection = connection
+                    self._pending_connection = None
+                    self._unconfirmed_connection = connection
+            except Exception:
+                if connection is not None:
+                    try:
+                        connection.disconnect()
+                    except Exception:
+                        pass
+                with self._connection_lock:
+                    if self._pending_connection is connection:
+                        self._pending_connection = None
+                    if self.connection is connection:
+                        self.connection = None
+                    if self._unconfirmed_connection is connection:
+                        self._unconfirmed_connection = None
+                raise
 
         worker = AsyncWorker(self, pairing)
 
@@ -142,7 +188,68 @@ class PlotterUI(Form_plotter):
         worker.signal.error.connect(lambda e: (fail_callback(e), self.thread_pool.waitForDone()))
         self.thread_pool.start(worker)
 
+    def cancel_pending_pairing(self):
+        with self._connection_lock:
+            if self._pairing_cancel_event is not None:
+                self._pairing_cancel_event.set()
+            targets = tuple(
+                connection
+                for connection in (
+                    self._pending_connection,
+                    self._unconfirmed_connection,
+                )
+                if connection is not None
+            )
+            if self.connection is self._unconfirmed_connection:
+                self.connection = None
+            self._pending_connection = None
+            self._unconfirmed_connection = None
+        seen = set()
+        for pending in targets:
+            if id(pending) in seen:
+                continue
+            seen.add(id(pending))
+            try:
+                pending.disconnect()
+            except Exception:
+                pass
+
+    def shutdown(self):
+        with self._connection_lock:
+            if self._shutting_down:
+                return
+            self._shutting_down = True
+            if self._pairing_cancel_event is not None:
+                self._pairing_cancel_event.set()
+            connections = tuple(
+                connection
+                for connection in (
+                    self._pending_connection,
+                    self._unconfirmed_connection,
+                    self.connection,
+                )
+                if connection is not None
+            )
+            self._pending_connection = None
+            self._unconfirmed_connection = None
+            self.connection = None
+        seen = set()
+        for connection in connections:
+            identity = id(connection)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            try:
+                connection.disconnect()
+            except Exception:
+                pass
+        self.thread_pool.waitForDone(5000)
+        self.tempdir.cleanup()
+
     def ready_for_drawing(self):
+        with self._connection_lock:
+            self._unconfirmed_connection = None
+            self._pairing_cancel_event = None
         self.switch_connected.setChecked(True)
 
     def press_a(self):
@@ -411,6 +518,32 @@ class PlotterUI(Form_plotter):
 
 
 def main():
+    if "--verify-windows-bluetooth" in sys.argv:
+        parser = argparse.ArgumentParser(
+            prog=Path(sys.argv[0]).name,
+            description="Verify the packaged Windows Bluetooth backend and Switch handshake.",
+        )
+        parser.add_argument("--verify-windows-bluetooth", action="store_true", required=True)
+        parser.add_argument(
+            "--evidence-path",
+            default="SplatplostBluetooth-application-evidence.json",
+        )
+        parser.add_argument("--pairing-timeout-seconds", type=float, default=180.0)
+        parser.add_argument("--handshake-timeout-seconds", type=float, default=60.0)
+        parser.add_argument("--settle-seconds", type=float, default=1.0)
+        arguments = parser.parse_args(sys.argv[1:])
+        from splatplost.windows_bluetooth.acceptance import (
+            verify_windows_bluetooth_application,
+        )
+
+        result = verify_windows_bluetooth_application(
+            arguments.evidence_path,
+            pairing_timeout=max(0.1, arguments.pairing_timeout_seconds),
+            handshake_timeout=max(0.1, arguments.handshake_timeout_seconds),
+            settle_seconds=max(0.0, arguments.settle_seconds),
+        )
+        return 0 if result["passed"] else 1
+
     app = QApplication(sys.argv)
 
     form = QtWidgets.QMainWindow()
@@ -424,6 +557,7 @@ def main():
 
     window = PlotterUI(app, form)
     window.setupUi(form)
+    app.aboutToQuit.connect(window.shutdown)
     form.show()
 
     if "--smoke-test" in sys.argv:

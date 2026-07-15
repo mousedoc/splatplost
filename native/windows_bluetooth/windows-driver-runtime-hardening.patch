@@ -1,0 +1,3892 @@
+diff --git a/bluetooth/bthecho/bthcli/sys/queue.c b/bluetooth/bthecho/bthcli/sys/queue.c
+index 6f1e244c..ac8a5cfc 100644
+--- a/bluetooth/bthecho/bthcli/sys/queue.c
++++ b/bluetooth/bthecho/bthcli/sys/queue.c
+@@ -154,6 +154,7 @@ Arguments:
+         Request,
+         &brb,
+         memory,
++        NULL,
+         ACL_TRANSFER_DIRECTION_OUT
+         );
+ 
+@@ -271,6 +272,7 @@ Arguments:
+         Request,
+         &brb,
+         memory,
++        NULL,
+         ACL_TRANSFER_DIRECTION_IN | ACL_SHORT_TRANSFER_OK
+         );
+ 
+diff --git a/bluetooth/bthecho/bthsrv/sys/bridge.c b/bluetooth/bthecho/bthsrv/sys/bridge.c
+index ac2af627..5c80c697 100644
+--- a/bluetooth/bthecho/bthsrv/sys/bridge.c
++++ b/bluetooth/bthecho/bthsrv/sys/bridge.c
+@@ -2,8 +2,48 @@
+ #include "device.h"
+ #include "echo.h"
+ #include "bridge.h"
++#include "server.h"
+ 
++#if defined(EVENT_TRACING)
++#include "bridge.tmh"
++#endif
++
+-#define SPLATPLOST_MAX_REPORT_SIZE 64
++static VOID
++SplatplostResetPacketFifoLocked(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx
++    )
++{
++    DevCtx->PacketFifoHead = 0;
++    DevCtx->PacketFifoTail = 0;
++    DevCtx->PacketFifoCount = 0;
++}
++
++_IRQL_requires_max_(DISPATCH_LEVEL)
++static VOID
++SplatplostCompleteReadRequest(
++    _In_ WDFREQUEST Request,
++    _In_reads_bytes_(BufferLength) PVOID Buffer,
++    _In_ size_t BufferLength
++    )
++{
++    NTSTATUS status;
++    PVOID output = NULL;
++
++    status = WdfRequestRetrieveOutputBuffer(
++        Request,
++        BufferLength,
++        &output,
++        NULL
++        );
++    if (!NT_SUCCESS(status))
++    {
++        WdfRequestComplete(Request, status);
++        return;
++    }
++
++    RtlCopyMemory(output, Buffer, BufferLength);
++    WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, BufferLength);
++}
+ 
+ NTSTATUS
+ SplatplostBridgeInitialize(
+@@ -24,7 +60,7 @@ SplatplostBridgeInitialize(
+ 
+     WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(
+         &queueConfig,
+-        WdfIoQueueDispatchParallel
++        WdfIoQueueDispatchSequential
+         );
+     queueConfig.EvtIoRead = SplatplostEvtIoRead;
+     queueConfig.EvtIoWrite = SplatplostEvtIoWrite;
+@@ -41,6 +77,10 @@ SplatplostBridgeInitialize(
+     }
+ 
+     WDF_IO_QUEUE_CONFIG_INIT(&queueConfig, WdfIoQueueDispatchManual);
++    // This is a software-only holding queue. It must stay retrievable while
++    // file cleanup drains a departing controller's requests, including while
++    // the Bluetooth device is transitioning through a low-power state.
++    queueConfig.PowerManaged = WdfFalse;
+     WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
+     attributes.ParentObject = Device;
+ 
+@@ -52,6 +92,112 @@ SplatplostBridgeInitialize(
+         );
+ }
+ 
++VOID
++SplatplostEvtDeviceFileCreate(
++    _In_ WDFDEVICE Device,
++    _In_ WDFREQUEST Request,
++    _In_ WDFFILEOBJECT FileObject
++    )
++{
++    ACCESS_MASK desiredAccess = 0;
++    BOOLEAN controllerAccess;
++    NTSTATUS status = STATUS_SUCCESS;
++    WDF_REQUEST_PARAMETERS parameters;
++    PSPLATPLOST_FILE_CONTEXT fileCtx =
++        GetSplatplostFileContext(FileObject);
++    PBTHECHOSAMPLE_SERVER_CONTEXT devCtx =
++        GetServerDeviceContext(Device);
++
++    WDF_REQUEST_PARAMETERS_INIT(&parameters);
++    WdfRequestGetParameters(Request, &parameters);
++    if (parameters.Parameters.Create.SecurityContext != NULL)
++    {
++        desiredAccess =
++            parameters.Parameters.Create.SecurityContext->DesiredAccess;
++    }
++
++    controllerAccess =
++        (desiredAccess &
++         (FILE_READ_DATA | FILE_WRITE_DATA | FILE_APPEND_DATA |
++          GENERIC_READ | GENERIC_WRITE)) != 0;
++    fileCtx->OwnsController = FALSE;
++
++    if (controllerAccess)
++    {
++        WdfSpinLockAcquire(devCtx->ConnectionListLock);
++        if (devCtx->ControllerFileObject != NULL ||
++            devCtx->ControllerCleanupInProgress)
++        {
++            status = STATUS_SHARING_VIOLATION;
++        }
++        else
++        {
++            devCtx->ControllerFileObject = FileObject;
++            fileCtx->OwnsController = TRUE;
++        }
++        WdfSpinLockRelease(devCtx->ConnectionListLock);
++    }
++
++    WdfRequestComplete(Request, status);
++}
++
++VOID
++SplatplostEvtFileCleanup(
++    _In_ WDFFILEOBJECT FileObject
++    )
++{
++    WDFREQUEST request;
++    NTSTATUS status;
++    PSPLATPLOST_FILE_CONTEXT fileCtx =
++        GetSplatplostFileContext(FileObject);
++    PBTHECHOSAMPLE_SERVER_CONTEXT devCtx =
++        GetServerDeviceContext(WdfFileObjectGetDevice(FileObject));
++
++    if (!fileCtx->OwnsController)
++    {
++        return;
++    }
++
++    WdfSpinLockAcquire(devCtx->ConnectionListLock);
++    if (devCtx->ControllerFileObject == FileObject)
++    {
++        devCtx->ControllerFileObject = NULL;
++        devCtx->ControllerCleanupInProgress = TRUE;
++        SplatplostResetPacketFifoLocked(devCtx);
++    }
++    fileCtx->OwnsController = FALSE;
++    WdfSpinLockRelease(devCtx->ConnectionListLock);
++
++    // EvtFileCleanup can run while manual-queue requests still exist. Remove
++    // only this controller's reads before admitting a replacement owner.
++    for (;;)
++    {
++        status = WdfIoQueueRetrieveRequestByFileObject(
++            devCtx->PendingReads,
++            FileObject,
++            &request
++            );
++        if (!NT_SUCCESS(status))
++        {
++            if (status != STATUS_NO_MORE_ENTRIES)
++            {
++                TraceEvents(
++                    TRACE_LEVEL_ERROR,
++                    DBG_PNP,
++                    "Unable to drain controller read queue, status = %!STATUS!\n",
++                    status
++                    );
++            }
++            break;
++        }
++        WdfRequestComplete(request, STATUS_CANCELLED);
++    }
++
++    WdfSpinLockAcquire(devCtx->ConnectionListLock);
++    devCtx->ControllerCleanupInProgress = FALSE;
++    WdfSpinLockRelease(devCtx->ConnectionListLock);
++}
++
+ VOID
+ SplatplostEvtIoRead(
+     _In_ WDFQUEUE Queue,
+@@ -59,7 +205,11 @@ SplatplostEvtIoRead(
+     _In_ size_t Length
+     )
+ {
++    UCHAR bufferedReport[SPLATPLOST_MAX_REPORT_SIZE];
++    ULONG bufferedLength = 0;
++    BOOLEAN controllerOwner;
+     NTSTATUS status;
++    WDFFILEOBJECT fileObject = WdfRequestGetFileObject(Request);
+     PBTHECHOSAMPLE_SERVER_CONTEXT devCtx =
+         GetServerDeviceContext(WdfIoQueueGetDevice(Queue));
+ 
+@@ -68,9 +218,42 @@ SplatplostEvtIoRead(
+         return;
+     }
+ 
+-    status = WdfRequestForwardToIoQueue(Request, devCtx->PendingReads);
++    WdfSpinLockAcquire(devCtx->ConnectionListLock);
++    controllerOwner =
++        fileObject != NULL && devCtx->ControllerFileObject == fileObject;
++    if (!controllerOwner)
++    {
++        status = STATUS_ACCESS_DENIED;
++    }
++    else if (devCtx->PacketFifoCount != 0)
++    {
++        PSPLATPLOST_PACKET_ENTRY entry =
++            &devCtx->PacketFifo[devCtx->PacketFifoHead];
++
++        bufferedLength = entry->Length;
++        RtlCopyMemory(bufferedReport, entry->Data, bufferedLength);
++        devCtx->PacketFifoHead =
++            (devCtx->PacketFifoHead + 1) % SPLATPLOST_PACKET_FIFO_CAPACITY;
++        devCtx->PacketFifoCount--;
++        status = STATUS_SUCCESS;
++    }
++    else
++    {
++        // Forward while holding the FIFO lock. PacketReceived uses the same
++        // lock, preserving the invariant that queued packets and pending reads
++        // cannot pass each other.
++        status = WdfRequestForwardToIoQueue(Request, devCtx->PendingReads);
++    }
++    WdfSpinLockRelease(devCtx->ConnectionListLock);
++
+     if (!NT_SUCCESS(status)) {
+         WdfRequestComplete(Request, status);
++    } else if (bufferedLength != 0) {
++        SplatplostCompleteReadRequest(
++            Request,
++            bufferedReport,
++            bufferedLength
++            );
+     }
+ }
+ 
+@@ -83,7 +266,9 @@ SplatplostEvtIoWrite(
+ {
+     NTSTATUS status;
+     PVOID input = NULL;
++    BOOLEAN controllerOwner;
+     WDFOBJECT connectionObject = NULL;
++    WDFFILEOBJECT fileObject = WdfRequestGetFileObject(Request);
+     PBTHECHO_CONNECTION connection = NULL;
+     PBTHECHOSAMPLE_SERVER_CONTEXT devCtx =
+         GetServerDeviceContext(WdfIoQueueGetDevice(Queue));
+@@ -100,21 +285,49 @@ SplatplostEvtIoWrite(
+     }
+ 
+     WdfSpinLockAcquire(devCtx->ConnectionListLock);
+-    connectionObject = devCtx->InterruptConnection;
++    controllerOwner =
++        fileObject != NULL && devCtx->ControllerFileObject == fileObject;
++    if (controllerOwner) {
++        connectionObject = devCtx->InterruptConnection;
++    }
+     if (connectionObject != NULL) {
+-        WdfObjectReference(connectionObject);
++        connection = GetConnectionObjectContext(connectionObject);
++        if (devCtx->BridgeRemoteAddress == BTH_ADDR_NULL ||
++            connection->RemoteAddress != devCtx->BridgeRemoteAddress) {
++            connectionObject = NULL;
++            connection = NULL;
++        } else {
++            WdfObjectReference(connectionObject);
++        }
+     }
+     WdfSpinLockRelease(devCtx->ConnectionListLock);
+ 
++    if (!controllerOwner) {
++        WdfRequestComplete(Request, STATUS_ACCESS_DENIED);
++        return;
++    }
++
+     if (connectionObject == NULL) {
+         WdfRequestComplete(Request, STATUS_DEVICE_NOT_CONNECTED);
+         return;
+     }
+ 
+     connection = GetConnectionObjectContext(connectionObject);
+-    BthEchoSrvSendEcho(&devCtx->Header, connection, input, Length);
++    status = BthEchoSrvSendEcho(
++        &devCtx->Header,
++        connection,
++        input,
++        Length
++        );
+     WdfObjectDereference(connectionObject);
+-    WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, Length);
++    if (NT_SUCCESS(status))
++    {
++        WdfRequestCompleteWithInformation(Request, status, Length);
++    }
++    else
++    {
++        WdfRequestComplete(Request, status);
++    }
+ }
+ 
+ VOID
+@@ -156,10 +369,14 @@ SplatplostEvtIoDeviceControl(
+ 
+     RtlZeroMemory(output, sizeof(*output));
+     WdfSpinLockAcquire(devCtx->ConnectionListLock);
+-    if (devCtx->ControlConnection != NULL) {
++    if (devCtx->ControlConnection != NULL &&
++        GetConnectionObjectContext(devCtx->ControlConnection)->RemoteAddress ==
++            devCtx->BridgeRemoteAddress) {
+         output->ConnectedChannels |= 0x01;
+     }
+-    if (devCtx->InterruptConnection != NULL) {
++    if (devCtx->InterruptConnection != NULL &&
++        GetConnectionObjectContext(devCtx->InterruptConnection)->RemoteAddress ==
++            devCtx->BridgeRemoteAddress) {
+         output->ConnectedChannels |= 0x02;
+     }
+     output->ConnectedChannels |= devCtx->InitializationStage << 16;
+@@ -171,21 +388,156 @@ SplatplostEvtIoDeviceControl(
+ }
+ 
+ _IRQL_requires_max_(DISPATCH_LEVEL)
+-VOID
++NTSTATUS
+ SplatplostBridgeConnectionAdded(
+     _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
+     _In_ PBTHECHO_CONNECTION Connection
+     )
+ {
++    NTSTATUS status = STATUS_SUCCESS;
+     WDFOBJECT object = WdfObjectContextGetObject(Connection);
++    WDFOBJECT otherObject = NULL;
++
++    // PairingStateLock -> ConnectionListLock is the global lock order.
++    WdfSpinLockAcquire(DevCtx->PairingStateLock);
++    if (DevCtx->RegistrationStopping ||
++        DevCtx->SurpriseRemoved ||
++        DevCtx->TargetTransitioning ||
++        !DevCtx->DeviceServersReady ||
++        DevCtx->DeviceServerAddress != Connection->RemoteAddress ||
++        (DevCtx->ProvenRemoteAddress != BTH_ADDR_NULL &&
++         DevCtx->ProvenRemoteAddress != Connection->RemoteAddress)) {
++        WdfSpinLockRelease(DevCtx->PairingStateLock);
++        return STATUS_DEVICE_NOT_CONNECTED;
++    }
+ 
+     WdfSpinLockAcquire(DevCtx->ConnectionListLock);
++    Connection->BridgeReaderReady = FALSE;
++    if (!Connection->InConnectionList ||
++        Connection->TeardownRequested ||
++        InterlockedCompareExchange(
++            &Connection->DeleteRequested,
++            0,
++            0) != 0)
++    {
++        status = STATUS_DELETE_PENDING;
++        goto unlock;
++    }
++    if (DevCtx->BridgeRemoteAddress != BTH_ADDR_NULL &&
++        DevCtx->BridgeRemoteAddress != Connection->RemoteAddress) {
++        status = STATUS_DEVICE_BUSY;
++        goto unlock;
++    }
++
+     if (Connection->Psm == SPLATPLOST_CONTROL_PSM) {
++        if (DevCtx->ControlConnection != NULL &&
++            DevCtx->ControlConnection != object) {
++            status = STATUS_DEVICE_BUSY;
++            goto unlock;
++        }
++        otherObject = DevCtx->InterruptConnection;
+         DevCtx->ControlConnection = object;
+     } else if (Connection->Psm == SPLATPLOST_INTERRUPT_PSM) {
++        if (DevCtx->InterruptConnection != NULL &&
++            DevCtx->InterruptConnection != object) {
++            status = STATUS_DEVICE_BUSY;
++            goto unlock;
++        }
++        otherObject = DevCtx->ControlConnection;
++        SplatplostResetPacketFifoLocked(DevCtx);
+         DevCtx->InterruptConnection = object;
++    } else {
++        status = STATUS_INVALID_PARAMETER;
++        goto unlock;
++    }
++
++    if (otherObject != NULL &&
++        GetConnectionObjectContext(otherObject)->RemoteAddress !=
++            Connection->RemoteAddress) {
++        if (Connection->Psm == SPLATPLOST_CONTROL_PSM) {
++            DevCtx->ControlConnection = NULL;
++        } else {
++            DevCtx->InterruptConnection = NULL;
++        }
++        status = STATUS_DEVICE_BUSY;
++        goto unlock;
++    }
++
++    if (DevCtx->BridgeRemoteAddress == BTH_ADDR_NULL) {
++        DevCtx->BridgeRemoteAddress = Connection->RemoteAddress;
++    }
++
++unlock:
++    WdfSpinLockRelease(DevCtx->ConnectionListLock);
++    WdfSpinLockRelease(DevCtx->PairingStateLock);
++
++    return status;
++}
++
++_IRQL_requires_max_(DISPATCH_LEVEL)
++NTSTATUS
++SplatplostBridgeConnectionReady(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
++    _In_ PBTHECHO_CONNECTION Connection
++    )
++{
++    NTSTATUS status = STATUS_DEVICE_NOT_CONNECTED;
++    BOOLEAN targetProven = FALSE;
++    WDFOBJECT object = WdfObjectContextGetObject(Connection);
++
++    WdfSpinLockAcquire(DevCtx->PairingStateLock);
++    if (DevCtx->RegistrationStopping ||
++        DevCtx->SurpriseRemoved ||
++        DevCtx->TargetTransitioning ||
++        !DevCtx->DeviceServersReady ||
++        DevCtx->DeviceServerAddress != Connection->RemoteAddress ||
++        (DevCtx->ProvenRemoteAddress != BTH_ADDR_NULL &&
++         DevCtx->ProvenRemoteAddress != Connection->RemoteAddress))
++    {
++        WdfSpinLockRelease(DevCtx->PairingStateLock);
++        return status;
++    }
++
++    WdfSpinLockAcquire(DevCtx->ConnectionListLock);
++    if (Connection->InConnectionList &&
++        !Connection->TeardownRequested &&
++        InterlockedCompareExchange(
++            &Connection->DeleteRequested,
++            0,
++            0) == 0 &&
++        DevCtx->BridgeRemoteAddress == Connection->RemoteAddress &&
++        ((Connection->Psm == SPLATPLOST_CONTROL_PSM &&
++          DevCtx->ControlConnection == object) ||
++         (Connection->Psm == SPLATPLOST_INTERRUPT_PSM &&
++          DevCtx->InterruptConnection == object)))
++    {
++        Connection->BridgeReaderReady = TRUE;
++        status = STATUS_SUCCESS;
++        if (DevCtx->ControlConnection != NULL &&
++            DevCtx->InterruptConnection != NULL &&
++            GetConnectionObjectContext(
++                DevCtx->ControlConnection)->BridgeReaderReady &&
++            GetConnectionObjectContext(
++                DevCtx->InterruptConnection)->BridgeReaderReady &&
++            GetConnectionObjectContext(
++                DevCtx->ControlConnection)->RemoteAddress ==
++                    Connection->RemoteAddress &&
++            GetConnectionObjectContext(
++                DevCtx->InterruptConnection)->RemoteAddress ==
++                    Connection->RemoteAddress)
++        {
++            targetProven = TRUE;
++        }
+     }
+     WdfSpinLockRelease(DevCtx->ConnectionListLock);
++    WdfSpinLockRelease(DevCtx->PairingStateLock);
++
++    if (targetProven)
++    {
++        BthEchoSrvQueueProvenAddress(DevCtx, Connection->RemoteAddress);
++    }
++
++    return status;
+ }
+ 
+ _IRQL_requires_max_(DISPATCH_LEVEL)
+@@ -198,15 +550,38 @@ SplatplostBridgeConnectionRemoved(
+     WDFOBJECT object = WdfObjectContextGetObject(Connection);
+ 
+     WdfSpinLockAcquire(DevCtx->ConnectionListLock);
++    Connection->BridgeReaderReady = FALSE;
+     if (DevCtx->ControlConnection == object) {
+         DevCtx->ControlConnection = NULL;
++        SplatplostResetPacketFifoLocked(DevCtx);
+     }
+     if (DevCtx->InterruptConnection == object) {
+         DevCtx->InterruptConnection = NULL;
++        SplatplostResetPacketFifoLocked(DevCtx);
++    }
++    if (DevCtx->ControlConnection == NULL &&
++        DevCtx->InterruptConnection == NULL) {
++        DevCtx->BridgeRemoteAddress = BTH_ADDR_NULL;
+     }
+     WdfSpinLockRelease(DevCtx->ConnectionListLock);
+ }
+ 
++_IRQL_requires_max_(DISPATCH_LEVEL)
++VOID
++SplatplostBridgeAbandonConnection(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
++    _In_ PBTHECHO_CONNECTION Connection
++    )
++{
++    SplatplostBridgeConnectionRemoved(DevCtx, Connection);
++    BthEchoConnectionObjectContinuousReaderCancelReaders(Connection);
++
++    WdfSpinLockAcquire(Connection->ConnectionLock);
++    Connection->ConnectionState = ConnectionStateDisconnected;
++    KeSetEvent(&Connection->DisconnectEvent, IO_NO_INCREMENT, FALSE);
++    WdfSpinLockRelease(Connection->ConnectionLock);
++}
++
+ _IRQL_requires_max_(DISPATCH_LEVEL)
+ VOID
+ SplatplostBridgePacketReceived(
+@@ -218,7 +593,6 @@ SplatplostBridgePacketReceived(
+ {
+     NTSTATUS status;
+     WDFREQUEST request = NULL;
+-    PVOID output = NULL;
+     WDFOBJECT object = WdfObjectContextGetObject(Connection);
+ 
+     if (BufferLength == 0 || BufferLength > SPLATPLOST_MAX_REPORT_SIZE) {
+@@ -226,28 +600,51 @@ SplatplostBridgePacketReceived(
+     }
+ 
+     WdfSpinLockAcquire(DevCtx->ConnectionListLock);
+-    if (DevCtx->InterruptConnection != object) {
++    if (DevCtx->InterruptConnection != object ||
++        DevCtx->BridgeRemoteAddress == BTH_ADDR_NULL ||
++        Connection->RemoteAddress != DevCtx->BridgeRemoteAddress) {
+         WdfSpinLockRelease(DevCtx->ConnectionListLock);
+         return;
+     }
+-    WdfSpinLockRelease(DevCtx->ConnectionListLock);
+ 
+-    status = WdfIoQueueRetrieveNextRequest(DevCtx->PendingReads, &request);
+-    if (!NT_SUCCESS(status)) {
+-        return;
++    if (DevCtx->PacketFifoCount == 0 &&
++        DevCtx->ControllerFileObject != NULL)
++    {
++        status = WdfIoQueueRetrieveNextRequest(
++            DevCtx->PendingReads,
++            &request
++            );
++    }
++    else
++    {
++        status = STATUS_NO_MORE_ENTRIES;
+     }
+ 
+-    status = WdfRequestRetrieveOutputBuffer(
+-        request,
+-        BufferLength,
+-        &output,
+-        NULL
+-        );
+-    if (!NT_SUCCESS(status)) {
+-        WdfRequestComplete(request, status);
+-        return;
++    if (status == STATUS_NO_MORE_ENTRIES)
++    {
++        if (DevCtx->PacketFifoCount < SPLATPLOST_PACKET_FIFO_CAPACITY)
++        {
++            PSPLATPLOST_PACKET_ENTRY entry =
++                &DevCtx->PacketFifo[DevCtx->PacketFifoTail];
++
++            entry->Length = (USHORT)BufferLength;
++            RtlCopyMemory(entry->Data, Buffer, BufferLength);
++            DevCtx->PacketFifoTail =
++                (DevCtx->PacketFifoTail + 1) %
++                    SPLATPLOST_PACKET_FIFO_CAPACITY;
++            DevCtx->PacketFifoCount++;
++        }
++        else
++        {
++            // Preserve the oldest reports, which contain the connection and
++            // handshake sequence. A bounded overflow drops the newest packet.
++            DevCtx->PacketFifoDropped++;
++        }
+     }
++    WdfSpinLockRelease(DevCtx->ConnectionListLock);
+ 
+-    RtlCopyMemory(output, Buffer, BufferLength);
+-    WdfRequestCompleteWithInformation(request, STATUS_SUCCESS, BufferLength);
++    if (NT_SUCCESS(status) && request != NULL)
++    {
++        SplatplostCompleteReadRequest(request, Buffer, BufferLength);
++    }
+ }
+diff --git a/bluetooth/bthecho/bthsrv/sys/bridge.h b/bluetooth/bthecho/bthsrv/sys/bridge.h
+index 1b09a8b3..480c489b 100644
+--- a/bluetooth/bthecho/bthsrv/sys/bridge.h
++++ b/bluetooth/bthecho/bthsrv/sys/bridge.h
+@@ -22,12 +22,26 @@ SplatplostBridgeInitialize(
+     );
+ 
+ _IRQL_requires_max_(DISPATCH_LEVEL)
+-VOID
++NTSTATUS
+ SplatplostBridgeConnectionAdded(
+     _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
+     _In_ PBTHECHO_CONNECTION Connection
+     );
+ 
++_IRQL_requires_max_(DISPATCH_LEVEL)
++NTSTATUS
++SplatplostBridgeConnectionReady(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
++    _In_ PBTHECHO_CONNECTION Connection
++    );
++
++_IRQL_requires_max_(DISPATCH_LEVEL)
++VOID
++SplatplostBridgeAbandonConnection(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
++    _In_ PBTHECHO_CONNECTION Connection
++    );
++
+ _IRQL_requires_max_(DISPATCH_LEVEL)
+ VOID
+ SplatplostBridgeConnectionRemoved(
+@@ -47,3 +61,5 @@ SplatplostBridgePacketReceived(
+ EVT_WDF_IO_QUEUE_IO_READ SplatplostEvtIoRead;
+ EVT_WDF_IO_QUEUE_IO_WRITE SplatplostEvtIoWrite;
+ EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL SplatplostEvtIoDeviceControl;
++EVT_WDF_DEVICE_FILE_CREATE SplatplostEvtDeviceFileCreate;
++EVT_WDF_FILE_CLEANUP SplatplostEvtFileCleanup;
+diff --git a/bluetooth/bthecho/bthsrv/sys/device.c b/bluetooth/bthecho/bthsrv/sys/device.c
+index cb4e4ea5..f2023643 100644
+--- a/bluetooth/bthecho/bthsrv/sys/device.c
++++ b/bluetooth/bthecho/bthsrv/sys/device.c
+@@ -40,6 +40,7 @@ Environment:
+ #ifdef ALLOC_PRAGMA
+ #pragma alloc_text (PAGE, BthEchoSrvEvtDriverDeviceAdd)
+ #pragma alloc_text (PAGE, BthEchoSrvEvtDeviceSelfManagedIoCleanup)
++#pragma alloc_text (PAGE, BthEchoSrvEvtDeviceSurpriseRemoval)
+ #endif
+ 
+ NTSTATUS
+@@ -70,6 +71,8 @@ Return Value:
+     NTSTATUS                        status;
+     WDFDEVICE                       device;    
+     WDF_OBJECT_ATTRIBUTES           attributes;
++    WDF_OBJECT_ATTRIBUTES           fileAttributes;
++    WDF_FILEOBJECT_CONFIG           fileObjectConfig;
+     WDF_PNPPOWER_EVENT_CALLBACKS    pnpPowerCallbacks;
+     DECLARE_CONST_UNICODE_STRING(
+         deviceSddl,
+@@ -86,6 +89,7 @@ Return Value:
+     WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnpPowerCallbacks);
+     pnpPowerCallbacks.EvtDeviceSelfManagedIoInit = BthEchoSrvEvtDeviceSelfManagedIoInit;
+     pnpPowerCallbacks.EvtDeviceSelfManagedIoCleanup = BthEchoSrvEvtDeviceSelfManagedIoCleanup;
++    pnpPowerCallbacks.EvtDeviceSurpriseRemoval = BthEchoSrvEvtDeviceSurpriseRemoval;
+ 
+     WdfDeviceInitSetPnpPowerEventCallbacks(
+         DeviceInit,
+@@ -93,12 +97,30 @@ Return Value:
+         );
+ 
+     WdfDeviceInitSetIoType(DeviceInit, WdfDeviceIoBuffered);
+-    WdfDeviceInitSetExclusive(DeviceInit, TRUE);
++    WdfDeviceInitSetExclusive(DeviceInit, FALSE);
+     WdfDeviceInitSetCharacteristics(
+         DeviceInit,
+         FILE_AUTOGENERATED_DEVICE_NAME,
+         TRUE
+         );
++
++    // Status-only handles (desired access 0) may coexist with the GUI. The
++    // file callbacks enforce a single read/write controller owner.
++    WDF_FILEOBJECT_CONFIG_INIT(
++        &fileObjectConfig,
++        SplatplostEvtDeviceFileCreate,
++        WDF_NO_EVENT_CALLBACK,
++        SplatplostEvtFileCleanup
++        );
++    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(
++        &fileAttributes,
++        SPLATPLOST_FILE_CONTEXT
++        );
++    WdfDeviceInitSetFileObjectConfig(
++        DeviceInit,
++        &fileObjectConfig,
++        &fileAttributes
++        );
+     status = WdfDeviceInitAssignSDDLString(DeviceInit, &deviceSddl);
+     if (!NT_SUCCESS(status))
+     {
+@@ -184,15 +206,49 @@ Return Value:
+ --*/
+ {
+     NTSTATUS status;
++    BTH_ADDR persistedAddress = BTH_ADDR_NULL;
+     PBTHECHOSAMPLE_SERVER_CONTEXT devCtx = GetServerDeviceContext(Device);
+ 
+     devCtx->InitializationStage = SPLATPLOST_INIT_STAGE_LOCAL_INFO;
+-    status = BthEchoSharedRetrieveLocalInfo(&devCtx->Header);
++    if (!BthEchoSrvBeginBrbSubmission(devCtx))
++    {
++        status = STATUS_DEVICE_REMOVED;
++    }
++    else
++    {
++        status = BthEchoSharedRetrieveLocalInfo(&devCtx->Header);
++        BthEchoSrvEndBrbSubmission(devCtx);
++    }
+     if (!NT_SUCCESS(status))
+     {
+         goto failed;
+     }
+ 
++    status = BthEchoSrvLoadPersistedAddress(devCtx, &persistedAddress);
++    if (!NT_SUCCESS(status))
++    {
++        TraceEvents(
++            TRACE_LEVEL_WARNING,
++            DBG_PNP,
++            "Unable to load the proven remote address, Status code %!STATUS!\n",
++            status
++            );
++        persistedAddress = BTH_ADDR_NULL;
++        status = STATUS_SUCCESS;
++    }
++
++    if (persistedAddress != BTH_ADDR_NULL)
++    {
++        WdfSpinLockAcquire(devCtx->PairingStateLock);
++        devCtx->PendingPairingAddress = persistedAddress;
++        devCtx->PendingPairingPresent = TRUE;
++        devCtx->ProvenRemoteAddress = persistedAddress;
++        devCtx->PersistedRemoteAddress = persistedAddress;
++        devCtx->PersistenceAddress = persistedAddress;
++        devCtx->TargetTransitioning = TRUE;
++        WdfSpinLockRelease(devCtx->PairingStateLock);
++    }
++
+     // Once the notification callback is registered it can queue the pairing
+     // worker immediately. Keep Header.Request serialized until SDP is live.
+     WdfWaitLockAcquire(devCtx->RegistrationLock, NULL);
+@@ -205,6 +261,36 @@ Return Value:
+         goto failed;
+     }
+ 
++    if (persistedAddress != BTH_ADDR_NULL)
++    {
++        devCtx->InitializationStage = SPLATPLOST_INIT_STAGE_PSM;
++        status = BthEchoSrvRegisterDeviceServersLocked(
++            devCtx,
++            persistedAddress
++            );
++        if (!NT_SUCCESS(status))
++        {
++            WdfWaitLockRelease(devCtx->RegistrationLock);
++            goto failed;
++        }
++
++        // Registration can synchronously overlap pair/unpair indications.
++        // Publish readiness only if the persisted device is still the current
++        // desired target; otherwise the queued worker tears these stale
++        // registrations down after RegistrationLock is released.
++        WdfSpinLockAcquire(devCtx->PairingStateLock);
++        if (!devCtx->RegistrationStopping &&
++            !devCtx->SurpriseRemoved &&
++            devCtx->PendingPairingPresent &&
++            devCtx->PendingPairingAddress == persistedAddress &&
++            devCtx->DeviceServerAddress == persistedAddress)
++        {
++            devCtx->DeviceServersReady = TRUE;
++            devCtx->TargetTransitioning = FALSE;
++        }
++        WdfSpinLockRelease(devCtx->PairingStateLock);
++    }
++
+     devCtx->InitializationStage = SPLATPLOST_INIT_STAGE_SDP;
+     status = BthEchoSrvPublishSdpRecord(
+         devCtx,
+@@ -234,7 +320,36 @@ failed:
+     devCtx->InitializationStatus = status;
+     WdfSpinLockRelease(devCtx->ConnectionListLock);
+     return STATUS_SUCCESS;
+-}    
++}
++
++VOID
++BthEchoSrvEvtDeviceSurpriseRemoval(
++    _In_ WDFDEVICE Device
++    )
++{
++    PBTHECHOSAMPLE_SERVER_CONTEXT devCtx = GetServerDeviceContext(Device);
++
++    PAGED_CODE();
++
++    // BthPort no longer accepts profile BRBs after surprise removal. Stop the
++    // reusable worker without attempting to unregister servers or SDP.
++    WdfSpinLockAcquire(devCtx->PairingStateLock);
++    devCtx->SurpriseRemoved = TRUE;
++    devCtx->RegistrationStopping = TRUE;
++    devCtx->TargetTransitioning = TRUE;
++    devCtx->PairingGeneration++;
++    WdfSpinLockRelease(devCtx->PairingStateLock);
++
++    KeWaitForSingleObject(
++        &devCtx->BrbRundownEvent,
++        Executive,
++        KernelMode,
++        FALSE,
++        NULL
++        );
++    WdfWorkItemFlush(devCtx->PairingWorkItem);
++    BthEchoSrvAbandonConnectionsOnSurpriseRemoval(devCtx);
++}
+ 
+ VOID
+ BthEchoSrvEvtDeviceSelfManagedIoCleanup(
+@@ -261,6 +376,7 @@ Return Value:
+ 
+ --*/
+ {
++    BOOLEAN surpriseRemoved;
+     PBTHECHOSAMPLE_SERVER_CONTEXT devCtx = GetServerDeviceContext(Device);
+         
+     PAGED_CODE();
+@@ -269,7 +385,12 @@ Return Value:
+     // Header.Request for SDP removal.
+     BthEchoSrvStopPairingRegistration(devCtx);
+ 
+-    if (HANDLE_SDP_NULL != devCtx->SdpRecordHandle)
++    WdfSpinLockAcquire(devCtx->PairingStateLock);
++    surpriseRemoved = devCtx->SurpriseRemoved;
++    WdfSpinLockRelease(devCtx->PairingStateLock);
++
++    if (!surpriseRemoved &&
++        HANDLE_SDP_NULL != devCtx->SdpRecordHandle)
+     {
+         WdfWaitLockAcquire(devCtx->RegistrationLock, NULL);
+         BthEchoSrvRemoveSdpRecord(devCtx);
+@@ -286,7 +407,14 @@ Return Value:
+     // disconnect would complete before device object is cleaned up.
+     //
+     
+-    BthEchoSrvDisconnectConnectionsOnRemove(devCtx);
++    if (surpriseRemoved)
++    {
++        BthEchoSrvAbandonConnectionsOnSurpriseRemoval(devCtx);
++    }
++    else
++    {
++        BthEchoSrvDisconnectConnectionsOnRemove(devCtx);
++    }
+ 
+     return;
+ }
+@@ -388,15 +516,21 @@ Arguments:
+         goto exit;
+     }
+ 
+-    SplatplostBridgeConnectionAdded(
++    // Attach the bridge before submitting the first read. A controller may
++    // send its first HID report immediately, including synchronously with the
++    // submit path; the bridge FIFO must already be able to retain it.
++    status = SplatplostBridgeConnectionAdded(
+         (PBTHECHOSAMPLE_SERVER_CONTEXT)connection->DevCtxHdr,
+         connection
+         );
++    if (!NT_SUCCESS(status))
++    {
++        goto exit;
++    }
+ 
+     status = BthEchoConnectionObjectContinuousReaderSubmitReaders(
+         connection
+         );
+-
+     if (!NT_SUCCESS(status))
+     {
+         SplatplostBridgeConnectionRemoved(
+@@ -405,6 +539,11 @@ Arguments:
+             );
+         goto exit;
+     }
++
++    status = SplatplostBridgeConnectionReady(
++        (PBTHECHOSAMPLE_SERVER_CONTEXT)connection->DevCtxHdr,
++        connection
++        );
+     
+ exit:    
+     return status;
+diff --git a/bluetooth/bthecho/bthsrv/sys/device.h b/bluetooth/bthecho/bthsrv/sys/device.h
+index ee6622e6..fb85500e 100644
+--- a/bluetooth/bthecho/bthsrv/sys/device.h
++++ b/bluetooth/bthecho/bthsrv/sys/device.h
+@@ -2,6 +2,25 @@
+ 
+ EVT_WDF_WORKITEM BthEchoSrvPairingWorkItem;
+ 
++#define SPLATPLOST_MAX_REPORT_SIZE 64
++#define SPLATPLOST_PACKET_FIFO_CAPACITY 128
++
++typedef struct _SPLATPLOST_PACKET_ENTRY
++{
++    USHORT Length;
++    UCHAR Data[SPLATPLOST_MAX_REPORT_SIZE];
++} SPLATPLOST_PACKET_ENTRY, *PSPLATPLOST_PACKET_ENTRY;
++
++typedef struct _SPLATPLOST_FILE_CONTEXT
++{
++    BOOLEAN OwnsController;
++} SPLATPLOST_FILE_CONTEXT, *PSPLATPLOST_FILE_CONTEXT;
++
++WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(
++    SPLATPLOST_FILE_CONTEXT,
++    GetSplatplostFileContext
++    )
++
+ typedef struct _BTHECHOSAMPLE_SERVER_CONTEXT
+ {
+     //
+@@ -45,11 +64,19 @@ typedef struct _BTHECHOSAMPLE_SERVER_CONTEXT
+     WDFSPINLOCK PairingStateLock;
+     WDFWORKITEM PairingWorkItem;
+     BTH_ADDR PendingPairingAddress;
++    BTH_ADDR ProvenRemoteAddress;
++    BTH_ADDR PersistedRemoteAddress;
++    BTH_ADDR PersistenceAddress;
+     ULONG PairingGeneration;
+     BOOLEAN DeviceServersReady;
+     BOOLEAN PendingPairingPresent;
++    BOOLEAN PersistenceUpdatePending;
+     BOOLEAN PairingWorkScheduled;
++    BOOLEAN TargetTransitioning;
+     BOOLEAN RegistrationStopping;
++    BOOLEAN SurpriseRemoved;
++    ULONG ActiveBrbSubmissions;
++    KEVENT BrbRundownEvent;
+     
+     //
+     // Connection List lock
+@@ -66,6 +93,14 @@ typedef struct _BTHECHOSAMPLE_SERVER_CONTEXT
+     //
+     WDFOBJECT ControlConnection;
+     WDFOBJECT InterruptConnection;
++    BTH_ADDR BridgeRemoteAddress;
++    WDFFILEOBJECT ControllerFileObject;
++    BOOLEAN ControllerCleanupInProgress;
++    SPLATPLOST_PACKET_ENTRY PacketFifo[SPLATPLOST_PACKET_FIFO_CAPACITY];
++    ULONG PacketFifoHead;
++    ULONG PacketFifoTail;
++    ULONG PacketFifoCount;
++    ULONG PacketFifoDropped;
+     WDFQUEUE PendingReads;
+     NTSTATUS InitializationStatus;
+     ULONG InitializationStage;
+@@ -137,10 +172,25 @@ BthEchoSampleServerContextInit(
+     }
+ 
+     InitializeListHead(&Context->ConnectionList);
++    KeInitializeEvent(
++        &Context->BrbRundownEvent,
++        NotificationEvent,
++        TRUE
++        );
+     Context->Psms[0] = 0x0011;
+     Context->Psms[1] = 0x0013;
+     Context->DeviceServerAddress = BTH_ADDR_NULL;
+     Context->PendingPairingAddress = BTH_ADDR_NULL;
++    Context->ProvenRemoteAddress = BTH_ADDR_NULL;
++    Context->PersistedRemoteAddress = BTH_ADDR_NULL;
++    Context->PersistenceAddress = BTH_ADDR_NULL;
++    Context->BridgeRemoteAddress = BTH_ADDR_NULL;
++    Context->ControllerFileObject = NULL;
++    Context->ControllerCleanupInProgress = FALSE;
++    Context->PacketFifoHead = 0;
++    Context->PacketFifoTail = 0;
++    Context->PacketFifoCount = 0;
++    Context->PacketFifoDropped = 0;
+     Context->InitializationStatus = STATUS_DEVICE_NOT_READY;
+     Context->InitializationStage = 0;
+ 
+@@ -154,6 +204,8 @@ EVT_WDF_DEVICE_SELF_MANAGED_IO_INIT BthEchoSrvEvtDeviceSelfManagedIoInit;
+ 
+ EVT_WDF_DEVICE_SELF_MANAGED_IO_CLEANUP BthEchoSrvEvtDeviceSelfManagedIoCleanup;
+ 
++EVT_WDF_DEVICE_SURPRISE_REMOVAL BthEchoSrvEvtDeviceSurpriseRemoval;
++
+ //////////////////////////////////////////////////////
+ // Device specific functionality invoked by server.c
+ //////////////////////////////////////////////////////
+diff --git a/bluetooth/bthecho/bthsrv/sys/echo.c b/bluetooth/bthecho/bthsrv/sys/echo.c
+index 8a31d8ee..d36391d2 100644
+--- a/bluetooth/bthecho/bthsrv/sys/echo.c
++++ b/bluetooth/bthecho/bthsrv/sys/echo.c
+@@ -78,7 +78,7 @@ Arguments:
+ 
+ 
+ _IRQL_requires_max_(DISPATCH_LEVEL)
+-VOID
++NTSTATUS
+ BthEchoSrvSendEcho(
+     _In_ PBTHECHOSAMPLE_DEVICE_CONTEXT_HEADER DevCtxHdr,
+     _In_ PBTHECHO_CONNECTION Connection,
+@@ -103,6 +103,8 @@ Arguments:
+ --*/
+ {
+     NTSTATUS status;
++    BOOLEAN brbSubmissionStarted = FALSE;
++    BOOLEAN requestSent;
+     WDF_OBJECT_ATTRIBUTES attributes;
+     WDFREQUEST request                  = NULL;
+     WDFMEMORY memory                    = NULL;
+@@ -133,8 +135,8 @@ Arguments:
+     if (SrcBufferLength <= 0) 
+     {
+         TraceEvents(TRACE_LEVEL_ERROR, DBG_CONT_READER,
+-            "SrcBufferLength has an invalid value: %I64d\n",
+-            SrcBufferLength
++            "SrcBufferLength has an invalid value: %I64u\n",
++            (ULONGLONG)SrcBufferLength
+             );
+ 
+         status = STATUS_INVALID_PARAMETER;
+@@ -173,6 +175,7 @@ Arguments:
+         request,
+         &brb,
+         memory,
++        NULL,
+         ACL_TRANSFER_DIRECTION_OUT
+         );
+ 
+@@ -191,11 +194,29 @@ Arguments:
+         Connection
+         );
+ 
+-    if (FALSE == WdfRequestSend(
++    if (!BthEchoSrvBeginBrbSubmission(
++            (PBTHECHOSAMPLE_SERVER_CONTEXT)DevCtxHdr))
++    {
++        status = STATUS_DEVICE_REMOVED;
++        goto exit;
++    }
++    brbSubmissionStarted = TRUE;
++
++    requestSent = WdfRequestSend(
+         request,
+         DevCtxHdr->IoTarget,
+         NULL
+-        ))
++        );
++
++    if (brbSubmissionStarted)
++    {
++        BthEchoSrvEndBrbSubmission(
++            (PBTHECHOSAMPLE_SERVER_CONTEXT)DevCtxHdr
++            );
++        brbSubmissionStarted = FALSE;
++    }
++
++    if (FALSE == requestSent)
+     {
+         status = WdfRequestGetStatus(request);
+ 
+@@ -210,6 +231,12 @@ Arguments:
+     }    
+ 
+ exit:
++    if (brbSubmissionStarted)
++    {
++        BthEchoSrvEndBrbSubmission(
++            (PBTHECHOSAMPLE_SERVER_CONTEXT)DevCtxHdr
++            );
++    }
+     if (!NT_SUCCESS(status))
+     {
+         if (NULL != request)
+@@ -222,6 +249,8 @@ exit:
+         //
+         BthEchoSrvDisconnectConnection(Connection);        
+     }    
++
++    return status;
+ }
+ 
+ 
+diff --git a/bluetooth/bthecho/bthsrv/sys/echo.h b/bluetooth/bthecho/bthsrv/sys/echo.h
+index 7fde0913..dd45352e 100644
+--- a/bluetooth/bthecho/bthsrv/sys/echo.h
++++ b/bluetooth/bthecho/bthsrv/sys/echo.h
+@@ -23,7 +23,7 @@ Environment:
+ --*/
+ 
+ _IRQL_requires_max_(DISPATCH_LEVEL)
+-VOID
++NTSTATUS
+ BthEchoSrvSendEcho(
+     _In_ PBTHECHOSAMPLE_DEVICE_CONTEXT_HEADER DevCtxHdr,
+     _In_ PBTHECHO_CONNECTION Connection,
+diff --git a/bluetooth/bthecho/bthsrv/sys/server.c b/bluetooth/bthecho/bthsrv/sys/server.c
+index 0272456b..c46e9a52 100644
+--- a/bluetooth/bthecho/bthsrv/sys/server.c
++++ b/bluetooth/bthecho/bthsrv/sys/server.c
+@@ -46,12 +46,72 @@ BthEchoSrvQueuePairingChange(
+     );
+ 
+ _IRQL_requires_max_(PASSIVE_LEVEL)
+-static NTSTATUS
++NTSTATUS
+ BthEchoSrvRegisterDeviceServersLocked(
+     _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
+     _In_ BTH_ADDR BtAddress
+     );
+ 
++_IRQL_requires_max_(PASSIVE_LEVEL)
++static NTSTATUS
++BthEchoSrvPersistAddress(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
++    _In_ BTH_ADDR BtAddress
++    );
++
++_IRQL_requires_max_(DISPATCH_LEVEL)
++static USHORT
++BthEchoSrvReserveConnection(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
++    _In_ PBTHECHO_CONNECTION Connection,
++    _In_ BTH_ADDR BtAddress,
++    _In_ USHORT Psm
++    );
++
++_IRQL_requires_max_(PASSIVE_LEVEL)
++static VOID
++BthEchoSrvDisconnectTargetConnections(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
++    _In_ BTH_ADDR BtAddress
++    );
++
++_IRQL_requires_max_(DISPATCH_LEVEL)
++static VOID
++BthEchoSrvDeleteConnectionObject(
++    _In_ PBTHECHO_CONNECTION Connection
++    );
++
++_IRQL_requires_max_(DISPATCH_LEVEL)
++BOOLEAN
++BthEchoSrvBeginBrbSubmission(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx
++    );
++
++_IRQL_requires_max_(DISPATCH_LEVEL)
++VOID
++BthEchoSrvEndBrbSubmission(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx
++    );
++
++_IRQL_requires_max_(DISPATCH_LEVEL)
++static BOOLEAN
++BthEchoSrvRemoteDisconnectGuarded(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
++    _In_ PBTHECHO_CONNECTION Connection
++    );
++
++_IRQL_requires_max_(DISPATCH_LEVEL)
++static BOOLEAN
++BthEchoSrvConnectionBeginBrbSubmission(
++    _In_ PVOID Context
++    );
++
++_IRQL_requires_max_(DISPATCH_LEVEL)
++static VOID
++BthEchoSrvConnectionEndBrbSubmission(
++    _In_ PVOID Context
++    );
++
+ _IRQL_requires_max_(PASSIVE_LEVEL)
+ static NTSTATUS
+ BthEchoSrvUnregisterDeviceServersLocked(
+@@ -68,29 +128,39 @@ BthEchoSrvUnregisterDeviceServersLocked(
+ #endif
+ 
+ void
+-InsertConnectionEntryLocked(
++RemoveConnectionEntryLocked(
+     PBTHECHOSAMPLE_SERVER_CONTEXT devCtx,
+     PLIST_ENTRY ple    
+     )
+ {
++    PBTHECHO_CONNECTION connection =
++        CONTAINING_RECORD(ple, BTHECHO_CONNECTION, ConnectionListEntry);
++
+     WdfSpinLockAcquire(devCtx->ConnectionListLock);
+ 
+-    InsertTailList(&devCtx->ConnectionList, ple);
++    if (connection->InConnectionList)
++    {
++        RemoveEntryList(ple);
++        InitializeListHead(ple);
++        connection->InConnectionList = FALSE;
++    }
+ 
+     WdfSpinLockRelease(devCtx->ConnectionListLock);    
+ }
+ 
+-void
+-RemoveConnectionEntryLocked(
+-    PBTHECHOSAMPLE_SERVER_CONTEXT devCtx,
+-    PLIST_ENTRY ple    
++_IRQL_requires_max_(DISPATCH_LEVEL)
++static VOID
++BthEchoSrvDeleteConnectionObject(
++    _In_ PBTHECHO_CONNECTION Connection
+     )
+ {
+-    WdfSpinLockAcquire(devCtx->ConnectionListLock);
+-
+-    RemoveEntryList(ple);
+-
+-    WdfSpinLockRelease(devCtx->ConnectionListLock);    
++    if (InterlockedCompareExchange(
++            &Connection->DeleteRequested,
++            1,
++            0) == 0)
++    {
++        WdfObjectDelete(WdfObjectContextGetObject(Connection));
++    }
+ }
+    
+ _IRQL_requires_max_(PASSIVE_LEVEL)
+@@ -188,7 +258,14 @@ Arguments:
+     switch(Indication)
+     {
+         case IndicationAddReference:
++            WdfObjectReference(
++                ((PBTHECHOSAMPLE_SERVER_CONTEXT)Context)->Header.Device
++                );
++            break;
+         case IndicationReleaseReference:
++            WdfObjectDereference(
++                ((PBTHECHOSAMPLE_SERVER_CONTEXT)Context)->Header.Device
++                );
+             break;
+         case IndicationRemoteConnect:
+         {
+@@ -264,8 +341,12 @@ Arguments:
+     switch(Indication)
+     {
+         case IndicationAddReference:
++            // Keep the callback context itself alive until BthPort states that
++            // this channel callback can no longer be invoked.
++            WdfObjectReference((WDFOBJECT)Context);
+             break;
+         case IndicationReleaseReference:
++            WdfObjectDereference((WDFOBJECT)Context);
+             break;
+         case IndicationRemoteConnect:
+         {
+@@ -327,8 +408,10 @@ Arguments:
+     switch(Indication)
+     {
+         case IndicationAddReference:
++            WdfObjectReference((WDFOBJECT)Context);
+             break;
+         case IndicationReleaseReference:
++            WdfObjectDereference((WDFOBJECT)Context);
+             break;
+         case IndicationRemoteConnect:
+         {
+@@ -362,6 +445,329 @@ Arguments:
+ 
+ #endif
+ 
++static BOOLEAN
++BthEchoSrvIsValidRemoteAddress(
++    _In_ BTH_ADDR BtAddress
++    )
++{
++    return BtAddress != BTH_ADDR_NULL &&
++        (BtAddress & ~0x0000FFFFFFFFFFFFULL) == 0;
++}
++
++_IRQL_requires_max_(DISPATCH_LEVEL)
++BOOLEAN
++BthEchoSrvBeginBrbSubmission(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx
++    )
++{
++    BOOLEAN allowed = FALSE;
++
++    WdfSpinLockAcquire(DevCtx->PairingStateLock);
++    if (!DevCtx->SurpriseRemoved)
++    {
++        DevCtx->ActiveBrbSubmissions++;
++        if (DevCtx->ActiveBrbSubmissions == 1)
++        {
++            KeClearEvent(&DevCtx->BrbRundownEvent);
++        }
++        allowed = TRUE;
++    }
++    WdfSpinLockRelease(DevCtx->PairingStateLock);
++
++    return allowed;
++}
++
++_IRQL_requires_max_(DISPATCH_LEVEL)
++VOID
++BthEchoSrvEndBrbSubmission(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx
++    )
++{
++    WdfSpinLockAcquire(DevCtx->PairingStateLock);
++    NT_ASSERT(DevCtx->ActiveBrbSubmissions != 0);
++    DevCtx->ActiveBrbSubmissions--;
++    if (DevCtx->ActiveBrbSubmissions == 0)
++    {
++        KeSetEvent(
++            &DevCtx->BrbRundownEvent,
++            IO_NO_INCREMENT,
++            FALSE
++            );
++    }
++    WdfSpinLockRelease(DevCtx->PairingStateLock);
++}
++
++_IRQL_requires_max_(DISPATCH_LEVEL)
++static BOOLEAN
++BthEchoSrvRemoteDisconnectGuarded(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
++    _In_ PBTHECHO_CONNECTION Connection
++    )
++{
++    BOOLEAN initiated;
++
++    if (!BthEchoSrvBeginBrbSubmission(DevCtx))
++    {
++        SplatplostBridgeAbandonConnection(DevCtx, Connection);
++        return FALSE;
++    }
++
++    initiated = BthEchoConnectionObjectRemoteDisconnect(
++        &DevCtx->Header,
++        Connection
++        );
++    BthEchoSrvEndBrbSubmission(DevCtx);
++    return initiated;
++}
++
++_IRQL_requires_max_(DISPATCH_LEVEL)
++static BOOLEAN
++BthEchoSrvConnectionBeginBrbSubmission(
++    _In_ PVOID Context
++    )
++{
++    return BthEchoSrvBeginBrbSubmission(
++        (PBTHECHOSAMPLE_SERVER_CONTEXT)Context
++        );
++}
++
++_IRQL_requires_max_(DISPATCH_LEVEL)
++static VOID
++BthEchoSrvConnectionEndBrbSubmission(
++    _In_ PVOID Context
++    )
++{
++    BthEchoSrvEndBrbSubmission(
++        (PBTHECHOSAMPLE_SERVER_CONTEXT)Context
++        );
++}
++
++_IRQL_requires_max_(PASSIVE_LEVEL)
++NTSTATUS
++BthEchoSrvLoadPersistedAddress(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
++    _Out_ BTH_ADDR *BtAddress
++    )
++{
++    NTSTATUS status;
++    WDFKEY key = NULL;
++    ULONG valueLength = 0;
++    ULONG valueType = REG_NONE;
++    DECLARE_CONST_UNICODE_STRING(valueName, L"ProvenRemoteAddress");
++
++    PAGED_CODE();
++
++    *BtAddress = BTH_ADDR_NULL;
++    status = WdfDriverOpenParametersRegistryKey(
++        WdfDeviceGetDriver(DevCtx->Header.Device),
++        KEY_QUERY_VALUE,
++        WDF_NO_OBJECT_ATTRIBUTES,
++        &key
++        );
++    if (!NT_SUCCESS(status))
++    {
++        return status;
++    }
++
++    status = WdfRegistryQueryValue(
++        key,
++        &valueName,
++        sizeof(*BtAddress),
++        BtAddress,
++        &valueLength,
++        &valueType
++        );
++    WdfRegistryClose(key);
++
++    if (status == STATUS_OBJECT_NAME_NOT_FOUND ||
++        status == STATUS_OBJECT_PATH_NOT_FOUND)
++    {
++        *BtAddress = BTH_ADDR_NULL;
++        return STATUS_SUCCESS;
++    }
++    if (!NT_SUCCESS(status))
++    {
++        *BtAddress = BTH_ADDR_NULL;
++        return status;
++    }
++    if (valueType != REG_QWORD ||
++        valueLength != sizeof(*BtAddress) ||
++        !BthEchoSrvIsValidRemoteAddress(*BtAddress))
++    {
++        *BtAddress = BTH_ADDR_NULL;
++        return STATUS_DATA_ERROR;
++    }
++
++    return STATUS_SUCCESS;
++}
++
++_IRQL_requires_max_(PASSIVE_LEVEL)
++static NTSTATUS
++BthEchoSrvPersistAddress(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
++    _In_ BTH_ADDR BtAddress
++    )
++{
++    NTSTATUS status;
++    WDFKEY key = NULL;
++    DECLARE_CONST_UNICODE_STRING(valueName, L"ProvenRemoteAddress");
++
++    PAGED_CODE();
++
++    if (BtAddress != BTH_ADDR_NULL &&
++        !BthEchoSrvIsValidRemoteAddress(BtAddress))
++    {
++        return STATUS_INVALID_PARAMETER;
++    }
++
++    status = WdfDriverOpenParametersRegistryKey(
++        WdfDeviceGetDriver(DevCtx->Header.Device),
++        KEY_SET_VALUE,
++        WDF_NO_OBJECT_ATTRIBUTES,
++        &key
++        );
++    if (!NT_SUCCESS(status))
++    {
++        return status;
++    }
++
++    if (BtAddress == BTH_ADDR_NULL)
++    {
++        status = WdfRegistryRemoveValue(key, &valueName);
++        if (status == STATUS_OBJECT_NAME_NOT_FOUND ||
++            status == STATUS_OBJECT_PATH_NOT_FOUND)
++        {
++            status = STATUS_SUCCESS;
++        }
++    }
++    else
++    {
++        status = WdfRegistryAssignValue(
++            key,
++            &valueName,
++            REG_QWORD,
++            sizeof(BtAddress),
++            &BtAddress
++            );
++    }
++
++    WdfRegistryClose(key);
++    return status;
++}
++
++_IRQL_requires_max_(DISPATCH_LEVEL)
++static USHORT
++BthEchoSrvReserveConnection(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
++    _In_ PBTHECHO_CONNECTION Connection,
++    _In_ BTH_ADDR BtAddress,
++    _In_ USHORT Psm
++    )
++{
++    USHORT response = CONNECT_RSP_RESULT_SECURITY_BLOCK;
++    PLIST_ENTRY entry;
++
++    Connection->RemoteAddress = BtAddress;
++    Connection->Psm = Psm;
++
++    if (Psm != SPLATPLOST_CONTROL_PSM &&
++        Psm != SPLATPLOST_INTERRUPT_PSM)
++    {
++        return CONNECT_RSP_RESULT_PSM_NEG;
++    }
++
++    WdfSpinLockAcquire(DevCtx->PairingStateLock);
++    if (DevCtx->RegistrationStopping ||
++        DevCtx->SurpriseRemoved ||
++        DevCtx->TargetTransitioning ||
++        !DevCtx->DeviceServersReady ||
++        DevCtx->DeviceServerAddress != BtAddress ||
++        (DevCtx->ProvenRemoteAddress != BTH_ADDR_NULL &&
++         DevCtx->ProvenRemoteAddress != BtAddress))
++    {
++        WdfSpinLockRelease(DevCtx->PairingStateLock);
++        return response;
++    }
++
++    WdfSpinLockAcquire(DevCtx->ConnectionListLock);
++    if (DevCtx->BridgeRemoteAddress != BTH_ADDR_NULL &&
++        DevCtx->BridgeRemoteAddress != BtAddress)
++    {
++        goto unlock;
++    }
++
++    for (entry = DevCtx->ConnectionList.Flink;
++         entry != &DevCtx->ConnectionList;
++         entry = entry->Flink)
++    {
++        PBTHECHO_CONNECTION existing = CONTAINING_RECORD(
++            entry,
++            BTHECHO_CONNECTION,
++            ConnectionListEntry
++            );
++
++        if (existing->RemoteAddress != BtAddress)
++        {
++            goto unlock;
++        }
++        if (existing->Psm == Psm)
++        {
++            response = CONNECT_RSP_RESULT_NO_RESOURCES;
++            goto unlock;
++        }
++    }
++
++    InsertTailList(&DevCtx->ConnectionList, &Connection->ConnectionListEntry);
++    Connection->InConnectionList = TRUE;
++    response = CONNECT_RSP_RESULT_SUCCESS;
++
++unlock:
++    WdfSpinLockRelease(DevCtx->ConnectionListLock);
++    WdfSpinLockRelease(DevCtx->PairingStateLock);
++    return response;
++}
++
++_IRQL_requires_max_(DISPATCH_LEVEL)
++VOID
++BthEchoSrvQueueProvenAddress(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
++    _In_ BTH_ADDR BtAddress
++    )
++{
++    if (!BthEchoSrvIsValidRemoteAddress(BtAddress))
++    {
++        return;
++    }
++
++    WdfSpinLockAcquire(DevCtx->PairingStateLock);
++    if (!DevCtx->RegistrationStopping &&
++        !DevCtx->SurpriseRemoved &&
++        !DevCtx->TargetTransitioning &&
++        DevCtx->DeviceServersReady &&
++        DevCtx->DeviceServerAddress == BtAddress &&
++        (DevCtx->ProvenRemoteAddress == BTH_ADDR_NULL ||
++         DevCtx->ProvenRemoteAddress == BtAddress))
++    {
++        DevCtx->ProvenRemoteAddress = BtAddress;
++        if (DevCtx->PersistedRemoteAddress != BtAddress)
++        {
++            DevCtx->PersistenceAddress = BtAddress;
++            DevCtx->PersistenceUpdatePending = TRUE;
++            DevCtx->PairingGeneration++;
++            if (!DevCtx->PairingWorkScheduled)
++            {
++                DevCtx->PairingWorkScheduled = TRUE;
++                // Enqueue before dropping PairingStateLock. Teardown sets its
++                // stop flag under the same lock, so its subsequent Flush
++                // cannot miss a producer that has only published the flag.
++                WdfWorkItemEnqueue(DevCtx->PairingWorkItem);
++            }
++        }
++    }
++    WdfSpinLockRelease(DevCtx->PairingStateLock);
++
++}
++
+ _IRQL_requires_max_(DISPATCH_LEVEL)
+ static VOID
+ BthEchoSrvQueuePairingChange(
+@@ -370,36 +776,67 @@ BthEchoSrvQueuePairingChange(
+     _In_ BOOLEAN Paired
+     )
+ {
+-    BOOLEAN enqueueWorkItem = FALSE;
++    BTH_ADDR activeAddress;
+     BOOLEAN stateChanged = FALSE;
+ 
+-    if (BtAddress == BTH_ADDR_NULL)
++    if (!BthEchoSrvIsValidRemoteAddress(BtAddress))
+     {
+         return;
+     }
+ 
+     WdfSpinLockAcquire(DevCtx->PairingStateLock);
+ 
+-    if (!DevCtx->RegistrationStopping)
++    if (!DevCtx->RegistrationStopping && !DevCtx->SurpriseRemoved)
+     {
++        activeAddress = DevCtx->ProvenRemoteAddress;
++        if (activeAddress == BTH_ADDR_NULL && DevCtx->DeviceServersReady)
++        {
++            activeAddress = DevCtx->DeviceServerAddress;
++        }
++
+         if (Paired)
+         {
+-            if (!DevCtx->PendingPairingPresent ||
+-                DevCtx->PendingPairingAddress != BtAddress ||
+-                !DevCtx->DeviceServersReady)
++            // Once a pair event selects a pending address, that selection is
++            // authoritative even before its servers finish registering. Only
++            // an explicit unpair can clear it and permit another address.
++            if (DevCtx->PendingPairingPresent)
++            {
++                if (DevCtx->PendingPairingAddress == BtAddress &&
++                    (!DevCtx->DeviceServersReady ||
++                     DevCtx->DeviceServerAddress != BtAddress ||
++                     DevCtx->TargetTransitioning))
++                {
++                    DevCtx->TargetTransitioning = TRUE;
++                    stateChanged = TRUE;
++                }
++            }
++            else if (activeAddress == BTH_ADDR_NULL ||
++                     activeAddress == BtAddress ||
++                     DevCtx->TargetTransitioning)
+             {
+                 DevCtx->PendingPairingPresent = TRUE;
+                 DevCtx->PendingPairingAddress = BtAddress;
++                DevCtx->TargetTransitioning = TRUE;
+                 stateChanged = TRUE;
+             }
+         }
+-        else if ((DevCtx->PendingPairingPresent &&
+-                  DevCtx->PendingPairingAddress == BtAddress) ||
+-                 (!DevCtx->PendingPairingPresent &&
++        else if (!(DevCtx->TargetTransitioning &&
++                   DevCtx->PendingPairingPresent &&
++                   DevCtx->PendingPairingAddress != BtAddress) &&
++                 (activeAddress == BtAddress ||
++                  (DevCtx->PendingPairingPresent &&
++                   DevCtx->PendingPairingAddress == BtAddress) ||
+                   DevCtx->DeviceServerAddress == BtAddress))
+         {
+             DevCtx->PendingPairingPresent = FALSE;
+             DevCtx->PendingPairingAddress = BtAddress;
++            DevCtx->TargetTransitioning = TRUE;
++            if (DevCtx->PersistedRemoteAddress == BtAddress ||
++                DevCtx->ProvenRemoteAddress == BtAddress)
++            {
++                DevCtx->PersistenceAddress = BTH_ADDR_NULL;
++                DevCtx->PersistenceUpdatePending = TRUE;
++            }
+             stateChanged = TRUE;
+         }
+ 
+@@ -409,17 +846,15 @@ BthEchoSrvQueuePairingChange(
+             if (!DevCtx->PairingWorkScheduled)
+             {
+                 DevCtx->PairingWorkScheduled = TRUE;
+-                enqueueWorkItem = TRUE;
++                // See BthEchoSrvQueueProvenAddress. Publishing and enqueueing
++                // are one operation with respect to Stop/Flush.
++                WdfWorkItemEnqueue(DevCtx->PairingWorkItem);
+             }
+         }
+     }
+ 
+     WdfSpinLockRelease(DevCtx->PairingStateLock);
+ 
+-    if (enqueueWorkItem)
+-    {
+-        WdfWorkItemEnqueue(DevCtx->PairingWorkItem);
+-    }
+ }
+ 
+ _IRQL_requires_max_(PASSIVE_LEVEL)
+@@ -445,11 +880,21 @@ BthEchoSrvUnregisterDeviceServersLocked(
+          index >= 0;
+          index--)
+     {
++        BOOLEAN surpriseRemoved;
++
+         if (DevCtx->DeviceServerHandles[index] == NULL)
+         {
+             continue;
+         }
+ 
++        WdfSpinLockAcquire(DevCtx->PairingStateLock);
++        surpriseRemoved = DevCtx->SurpriseRemoved;
++        WdfSpinLockRelease(DevCtx->PairingStateLock);
++        if (surpriseRemoved)
++        {
++            return STATUS_DEVICE_REMOVED;
++        }
++
+         DevCtx->Header.ProfileDrvInterface.BthReuseBrb(
+             &(DevCtx->RegisterUnregisterBrb),
+             BRB_L2CA_UNREGISTER_SERVER
+@@ -461,12 +906,20 @@ BthEchoSrvUnregisterDeviceServersLocked(
+         brb->Psm = DevCtx->Psms[index];
+         brb->ServerHandle = DevCtx->DeviceServerHandles[index];
+ 
+-        status = BthEchoSharedSendBrbSynchronously(
+-            DevCtx->Header.IoTarget,
+-            DevCtx->Header.Request,
+-            (PBRB)brb,
+-            sizeof(*brb)
+-            );
++        if (!BthEchoSrvBeginBrbSubmission(DevCtx))
++        {
++            status = STATUS_DEVICE_REMOVED;
++        }
++        else
++        {
++            status = BthEchoSharedSendBrbSynchronously(
++                DevCtx->Header.IoTarget,
++                DevCtx->Header.Request,
++                (PBRB)brb,
++                sizeof(*brb)
++                );
++            BthEchoSrvEndBrbSubmission(DevCtx);
++        }
+ 
+         if (NT_SUCCESS(status))
+         {
+@@ -501,7 +954,7 @@ BthEchoSrvUnregisterDeviceServersLocked(
+ }
+ 
+ _IRQL_requires_max_(PASSIVE_LEVEL)
+-static NTSTATUS
++NTSTATUS
+ BthEchoSrvRegisterDeviceServersLocked(
+     _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
+     _In_ BTH_ADDR BtAddress
+@@ -515,7 +968,7 @@ BthEchoSrvRegisterDeviceServersLocked(
+ 
+     PAGED_CODE();
+ 
+-    if (BtAddress == BTH_ADDR_NULL)
++    if (!BthEchoSrvIsValidRemoteAddress(BtAddress))
+     {
+         return STATUS_INVALID_PARAMETER;
+     }
+@@ -547,8 +1000,25 @@ BthEchoSrvRegisterDeviceServersLocked(
+     DevCtx->DeviceServerAddress = BtAddress;
+     WdfSpinLockRelease(DevCtx->PairingStateLock);
+ 
+-    for (index = 0; index < RTL_NUMBER_OF(DevCtx->Psms); index++)
+-    {
++    for (index = 0; index < RTL_NUMBER_OF(DevCtx->Psms); index++)
++    {
++        BOOLEAN stopping;
++        BOOLEAN surpriseRemoved;
++
++        WdfSpinLockAcquire(DevCtx->PairingStateLock);
++        stopping = DevCtx->RegistrationStopping;
++        surpriseRemoved = DevCtx->SurpriseRemoved;
++        WdfSpinLockRelease(DevCtx->PairingStateLock);
++        if (surpriseRemoved)
++        {
++            return STATUS_DEVICE_REMOVED;
++        }
++        if (stopping)
++        {
++            (void)BthEchoSrvUnregisterDeviceServersLocked(DevCtx);
++            return STATUS_CANCELLED;
++        }
++
+         DevCtx->Header.ProfileDrvInterface.BthReuseBrb(
+             &(DevCtx->RegisterUnregisterBrb),
+             BRB_L2CA_REGISTER_SERVER
+@@ -564,12 +1034,20 @@ BthEchoSrvRegisterDeviceServersLocked(
+         brb->ReferenceObject =
+             WdfDeviceWdmGetDeviceObject(DevCtx->Header.Device);
+ 
+-        status = BthEchoSharedSendBrbSynchronously(
+-            DevCtx->Header.IoTarget,
+-            DevCtx->Header.Request,
+-            (PBRB)brb,
+-            sizeof(*brb)
+-            );
++        if (!BthEchoSrvBeginBrbSubmission(DevCtx))
++        {
++            status = STATUS_DEVICE_REMOVED;
++        }
++        else
++        {
++            status = BthEchoSharedSendBrbSynchronously(
++                DevCtx->Header.IoTarget,
++                DevCtx->Header.Request,
++                (PBRB)brb,
++                sizeof(*brb)
++                );
++            BthEchoSrvEndBrbSubmission(DevCtx);
++        }
+ 
+         if (!NT_SUCCESS(status))
+         {
+@@ -587,13 +1065,64 @@ BthEchoSrvRegisterDeviceServersLocked(
+         DevCtx->DeviceServerHandles[index] = brb->ServerHandle;
+     }
+ 
+-    WdfSpinLockAcquire(DevCtx->PairingStateLock);
+-    DevCtx->DeviceServersReady = TRUE;
+-    WdfSpinLockRelease(DevCtx->PairingStateLock);
+-
++    // The caller publishes DeviceServersReady only after revalidating the
++    // desired address/generation. Pair/unpair indications can arrive while a
++    // synchronous registration BRB is in flight.
+     return STATUS_SUCCESS;
+ }
+ 
++_IRQL_requires_max_(PASSIVE_LEVEL)
++static VOID
++BthEchoSrvDisconnectTargetConnections(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
++    _In_ BTH_ADDR BtAddress
++    )
++{
++    WDFOBJECT connectionObjects[2];
++    ULONG connectionCount;
++    ULONG index;
++
++    PAGED_CODE();
++
++    do
++    {
++        PLIST_ENTRY entry;
++
++        connectionCount = 0;
++        WdfSpinLockAcquire(DevCtx->ConnectionListLock);
++        for (entry = DevCtx->ConnectionList.Flink;
++             entry != &DevCtx->ConnectionList &&
++                 connectionCount < RTL_NUMBER_OF(connectionObjects);
++             entry = entry->Flink)
++        {
++            PBTHECHO_CONNECTION connection = CONTAINING_RECORD(
++                entry,
++                BTHECHO_CONNECTION,
++                ConnectionListEntry
++                );
++
++            if (connection->RemoteAddress == BtAddress &&
++                !connection->TeardownRequested)
++            {
++                connection->TeardownRequested = TRUE;
++                connectionObjects[connectionCount] =
++                    WdfObjectContextGetObject(connection);
++                WdfObjectReference(connectionObjects[connectionCount]);
++                connectionCount++;
++            }
++        }
++        WdfSpinLockRelease(DevCtx->ConnectionListLock);
++
++        for (index = 0; index < connectionCount; index++)
++        {
++            BthEchoSrvDisconnectConnection(
++                GetConnectionObjectContext(connectionObjects[index])
++                );
++            WdfObjectDereference(connectionObjects[index]);
++        }
++    } while (connectionCount != 0);
++}
++
+ VOID
+ BthEchoSrvPairingWorkItem(
+     _In_ WDFWORKITEM WorkItem
+@@ -602,9 +1131,20 @@ BthEchoSrvPairingWorkItem(
+     PBTHECHOSAMPLE_SERVER_CONTEXT devCtx;
+     WDFDEVICE device;
+     BTH_ADDR btAddress;
++    BTH_ADDR persistenceAddress;
+     BTH_ADDR registeredAddress = BTH_ADDR_NULL;
++    BOOLEAN deviceServersReady;
+     BOOLEAN paired;
++    BOOLEAN persistencePending;
++    BOOLEAN generationCurrent;
++    BOOLEAN operationCurrent;
++    BOOLEAN registrationAttempted;
++    BOOLEAN registrationNeeded;
++    BOOLEAN removalNeeded;
++    BOOLEAN serversRegistered;
+     BOOLEAN stopping;
++    BOOLEAN surpriseRemoved;
++    BOOLEAN targetTransitioning;
+     ULONG generation;
+     NTSTATUS status = STATUS_SUCCESS;
+ 
+@@ -617,43 +1157,232 @@ BthEchoSrvPairingWorkItem(
+     {
+         WdfSpinLockAcquire(devCtx->PairingStateLock);
+         stopping = devCtx->RegistrationStopping;
++        surpriseRemoved = devCtx->SurpriseRemoved;
+         generation = devCtx->PairingGeneration;
+         btAddress = devCtx->PendingPairingAddress;
+         paired = devCtx->PendingPairingPresent;
++        persistenceAddress = devCtx->PersistenceAddress;
++        persistencePending = devCtx->PersistenceUpdatePending;
+         WdfSpinLockRelease(devCtx->PairingStateLock);
+ 
+-        if (!stopping)
++        registrationAttempted = FALSE;
++        operationCurrent = FALSE;
++        status = STATUS_SUCCESS;
++        if (!stopping && !surpriseRemoved)
+         {
+             WdfWaitLockAcquire(devCtx->RegistrationLock, NULL);
+ 
++            registrationNeeded = FALSE;
++            removalNeeded = FALSE;
+             WdfSpinLockAcquire(devCtx->PairingStateLock);
+             stopping = devCtx->RegistrationStopping;
+-            registeredAddress = devCtx->DeviceServerAddress;
+-            WdfSpinLockRelease(devCtx->PairingStateLock);
+-
+-            if (!stopping)
++            surpriseRemoved = devCtx->SurpriseRemoved;
++            generationCurrent = generation == devCtx->PairingGeneration;
++            if (!stopping && !surpriseRemoved && generationCurrent)
+             {
++                registeredAddress = devCtx->DeviceServerAddress;
++                deviceServersReady = devCtx->DeviceServersReady;
++                targetTransitioning = devCtx->TargetTransitioning;
+                 if (paired)
+                 {
+-                    status = BthEchoSrvRegisterDeviceServersLocked(
+-                        devCtx,
+-                        btAddress
+-                        );
++                    registrationNeeded =
++                        !deviceServersReady ||
++                        registeredAddress != btAddress ||
++                        targetTransitioning;
+                 }
+-                else if (registeredAddress == btAddress)
++                else
+                 {
+-                    status = BthEchoSrvUnregisterDeviceServersLocked(devCtx);
++                    removalNeeded =
++                        registeredAddress != BTH_ADDR_NULL ||
++                        devCtx->DeviceServerHandles[0] != NULL ||
++                        devCtx->DeviceServerHandles[1] != NULL;
+                 }
+-                else
++
++                if (registrationNeeded || removalNeeded)
+                 {
+-                    status = STATUS_SUCCESS;
++                    devCtx->TargetTransitioning = TRUE;
++                    devCtx->DeviceServersReady = FALSE;
++                }
++                else if (!paired)
++                {
++                    devCtx->ProvenRemoteAddress = BTH_ADDR_NULL;
++                    devCtx->TargetTransitioning = FALSE;
++                }
++            }
++            WdfSpinLockRelease(devCtx->PairingStateLock);
++
++            if (!stopping && !surpriseRemoved && generationCurrent)
++            {
++                if (registrationNeeded)
++                {
++                    registrationAttempted = TRUE;
++                    serversRegistered = FALSE;
++                    if (registeredAddress != BTH_ADDR_NULL ||
++                        devCtx->DeviceServerHandles[0] != NULL ||
++                        devCtx->DeviceServerHandles[1] != NULL)
++                    {
++                        if (registeredAddress != BTH_ADDR_NULL)
++                        {
++                            BthEchoSrvDisconnectTargetConnections(
++                                devCtx,
++                                registeredAddress
++                                );
++                        }
++
++                        WdfSpinLockAcquire(devCtx->PairingStateLock);
++                        surpriseRemoved = devCtx->SurpriseRemoved;
++                        WdfSpinLockRelease(devCtx->PairingStateLock);
++                        if (!surpriseRemoved)
++                        {
++                            status = BthEchoSrvUnregisterDeviceServersLocked(
++                                devCtx
++                                );
++                        }
++                        else
++                        {
++                            status = STATUS_DEVICE_REMOVED;
++                        }
++
++                        if (NT_SUCCESS(status))
++                        {
++                            WdfSpinLockAcquire(devCtx->PairingStateLock);
++                            if (devCtx->ProvenRemoteAddress == registeredAddress)
++                            {
++                                devCtx->ProvenRemoteAddress = BTH_ADDR_NULL;
++                            }
++                            WdfSpinLockRelease(devCtx->PairingStateLock);
++                        }
++                    }
++
++                    // A synchronous unregister can overlap another indication.
++                    // Never register the stale snapshot's address after that.
++                    WdfSpinLockAcquire(devCtx->PairingStateLock);
++                    generationCurrent =
++                        generation == devCtx->PairingGeneration &&
++                        !devCtx->RegistrationStopping &&
++                        !devCtx->SurpriseRemoved &&
++                        devCtx->PendingPairingPresent &&
++                        devCtx->PendingPairingAddress == btAddress;
++                    WdfSpinLockRelease(devCtx->PairingStateLock);
++
++                    if (NT_SUCCESS(status))
++                    {
++                        if (generationCurrent)
++                        {
++                            status = BthEchoSrvRegisterDeviceServersLocked(
++                                devCtx,
++                                btAddress
++                                );
++                            serversRegistered = NT_SUCCESS(status);
++                        }
++                    }
++
++                    // RegisterDeviceServersLocked deliberately does not publish
++                    // readiness. Revalidate after the synchronous BRBs so no
++                    // stale address ever gains an acceptance window.
++                    WdfSpinLockAcquire(devCtx->PairingStateLock);
++                    operationCurrent =
++                        generation == devCtx->PairingGeneration &&
++                        !devCtx->RegistrationStopping &&
++                        !devCtx->SurpriseRemoved &&
++                        devCtx->PendingPairingPresent &&
++                        devCtx->PendingPairingAddress == btAddress;
++                    if (operationCurrent && serversRegistered)
++                    {
++                        devCtx->DeviceServersReady = TRUE;
++                        devCtx->TargetTransitioning = FALSE;
++                    }
++                    WdfSpinLockRelease(devCtx->PairingStateLock);
++                }
++                else if (removalNeeded)
++                {
++                    registrationAttempted = TRUE;
++                    if (registeredAddress != BTH_ADDR_NULL)
++                    {
++                        BthEchoSrvDisconnectTargetConnections(
++                            devCtx,
++                            registeredAddress
++                            );
++                    }
++
++                    WdfSpinLockAcquire(devCtx->PairingStateLock);
++                    surpriseRemoved = devCtx->SurpriseRemoved;
++                    WdfSpinLockRelease(devCtx->PairingStateLock);
++                    if (!surpriseRemoved)
++                    {
++                        status = BthEchoSrvUnregisterDeviceServersLocked(devCtx);
++                    }
++                    else
++                    {
++                        status = STATUS_DEVICE_REMOVED;
++                    }
++
++                    WdfSpinLockAcquire(devCtx->PairingStateLock);
++                    operationCurrent =
++                        generation == devCtx->PairingGeneration &&
++                        !devCtx->RegistrationStopping &&
++                        !devCtx->SurpriseRemoved &&
++                        !devCtx->PendingPairingPresent &&
++                        devCtx->PendingPairingAddress == btAddress;
++                    if (NT_SUCCESS(status))
++                    {
++                        if (devCtx->ProvenRemoteAddress == registeredAddress)
++                        {
++                            devCtx->ProvenRemoteAddress = BTH_ADDR_NULL;
++                        }
++                        if (operationCurrent)
++                        {
++                            devCtx->TargetTransitioning = FALSE;
++                        }
++                    }
++                    WdfSpinLockRelease(devCtx->PairingStateLock);
+                 }
+             }
+ 
+             WdfWaitLockRelease(devCtx->RegistrationLock);
+         }
+ 
+-        if (!stopping)
++        if (persistencePending)
++        {
++            BOOLEAN persistCurrentRequest;
++
++            WdfSpinLockAcquire(devCtx->PairingStateLock);
++            persistCurrentRequest =
++                devCtx->PersistenceUpdatePending &&
++                devCtx->PersistenceAddress == persistenceAddress;
++            WdfSpinLockRelease(devCtx->PairingStateLock);
++
++            if (persistCurrentRequest)
++            {
++                NTSTATUS persistenceStatus = BthEchoSrvPersistAddress(
++                    devCtx,
++                    persistenceAddress
++                    );
++
++                if (NT_SUCCESS(persistenceStatus))
++                {
++                    WdfSpinLockAcquire(devCtx->PairingStateLock);
++                    if (devCtx->PersistenceUpdatePending &&
++                        devCtx->PersistenceAddress == persistenceAddress)
++                    {
++                        devCtx->PersistedRemoteAddress = persistenceAddress;
++                        devCtx->PersistenceUpdatePending = FALSE;
++                    }
++                    WdfSpinLockRelease(devCtx->PairingStateLock);
++                }
++                else
++                {
++                    TraceEvents(
++                        TRACE_LEVEL_ERROR,
++                        DBG_PNP,
++                        "Unable to persist the proven remote address, Status code %!STATUS!\n",
++                        persistenceStatus
++                        );
++                }
++            }
++        }
++
++        if (registrationAttempted && operationCurrent)
+         {
+             WdfSpinLockAcquire(devCtx->ConnectionListLock);
+             if (NT_SUCCESS(status))
+@@ -670,8 +1399,7 @@ BthEchoSrvPairingWorkItem(
+         }
+ 
+         WdfSpinLockAcquire(devCtx->PairingStateLock);
+-        if (devCtx->RegistrationStopping ||
+-            generation == devCtx->PairingGeneration)
++        if (generation == devCtx->PairingGeneration)
+         {
+             devCtx->PairingWorkScheduled = FALSE;
+             WdfSpinLockRelease(devCtx->PairingStateLock);
+@@ -730,12 +1458,20 @@ Return Value:
+         INDICATION_UNPERSONALIZE_DEVICE;
+     brb->ReferenceObject = WdfDeviceWdmGetDeviceObject(DevCtx->Header.Device);
+ 
+-    status = BthEchoSharedSendBrbSynchronously(
+-        DevCtx->Header.IoTarget,
+-        DevCtx->Header.Request,
+-        (PBRB) brb,
+-        sizeof(*brb)
+-        );
++    if (!BthEchoSrvBeginBrbSubmission(DevCtx))
++    {
++        status = STATUS_DEVICE_REMOVED;
++    }
++    else
++    {
++        status = BthEchoSharedSendBrbSynchronously(
++            DevCtx->Header.IoTarget,
++            DevCtx->Header.Request,
++            (PBRB) brb,
++            sizeof(*brb)
++            );
++        BthEchoSrvEndBrbSubmission(DevCtx);
++    }
+     
+     if (!NT_SUCCESS(status))
+     {
+@@ -801,23 +1537,28 @@ Return Value:
+     brb->Psm = 0;
+     brb->ServerHandle = DevCtx->PairingNotificationServerHandle;
+ 
+-    status = BthEchoSharedSendBrbSynchronously(
+-        DevCtx->Header.IoTarget,
+-        DevCtx->Header.Request,
+-        (PBRB) brb,
+-        sizeof(*(brb))
+-        );
++    if (!BthEchoSrvBeginBrbSubmission(DevCtx))
++    {
++        status = STATUS_DEVICE_REMOVED;
++    }
++    else
++    {
++        status = BthEchoSharedSendBrbSynchronously(
++            DevCtx->Header.IoTarget,
++            DevCtx->Header.Request,
++            (PBRB) brb,
++            sizeof(*(brb))
++            );
++        BthEchoSrvEndBrbSubmission(DevCtx);
++    }
+ 
+     if (!NT_SUCCESS(status))
+     {
+         TraceEvents(TRACE_LEVEL_ERROR, DBG_PNP, 
+             "BRB_L2CA_UNREGISTER_SERVER failed, Status code %!STATUS!\n", status);
+ 
+-        //
+-        // Send does not fail for resource reasons
+-        //
+-        NT_ASSERT(FALSE);
+-        
++        // Keep the handle intact. ReferenceObject keeps the device alive until
++        // BthPort releases the failed registration during stack teardown.
+         goto exit;        
+     }
+ 
+@@ -833,22 +1574,31 @@ BthEchoSrvStopPairingRegistration(
+     _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx
+     )
+ {
++    BOOLEAN surpriseRemoved;
++
+     PAGED_CODE();
+ 
+     WdfSpinLockAcquire(DevCtx->PairingStateLock);
+     DevCtx->RegistrationStopping = TRUE;
+     DevCtx->PairingGeneration++;
++    surpriseRemoved = DevCtx->SurpriseRemoved;
+     WdfSpinLockRelease(DevCtx->PairingStateLock);
+ 
+     // Stop callbacks first, then wait for the one reusable worker to finish.
+-    WdfWaitLockAcquire(DevCtx->RegistrationLock, NULL);
+-    BthEchoSrvUnregisterL2CAPServer(DevCtx);
+-    WdfWaitLockRelease(DevCtx->RegistrationLock);
++    if (!surpriseRemoved)
++    {
++        WdfWaitLockAcquire(DevCtx->RegistrationLock, NULL);
++        BthEchoSrvUnregisterL2CAPServer(DevCtx);
++        WdfWaitLockRelease(DevCtx->RegistrationLock);
++    }
+     WdfWorkItemFlush(DevCtx->PairingWorkItem);
+ 
+-    WdfWaitLockAcquire(DevCtx->RegistrationLock, NULL);
+-    (void)BthEchoSrvUnregisterDeviceServersLocked(DevCtx);
+-    WdfWaitLockRelease(DevCtx->RegistrationLock);
++    if (!surpriseRemoved)
++    {
++        WdfWaitLockAcquire(DevCtx->RegistrationLock, NULL);
++        (void)BthEchoSrvUnregisterDeviceServersLocked(DevCtx);
++        WdfWaitLockRelease(DevCtx->RegistrationLock);
++    }
+ }
+ 
+ _IRQL_requires_max_(PASSIVE_LEVEL)
+@@ -879,7 +1629,7 @@ Return Value:
+ 
+ --*/
+ {
+-    NTSTATUS status, statusReuse;
++    NTSTATUS status;
+     WDF_MEMORY_DESCRIPTOR inMemDesc;
+     WDF_MEMORY_DESCRIPTOR outMemDesc;
+     WDF_REQUEST_REUSE_PARAMS ReuseParams;
+@@ -888,9 +1638,17 @@ Return Value:
+     PAGED_CODE();
+     
+     WDF_REQUEST_REUSE_PARAMS_INIT(&ReuseParams, WDF_REQUEST_REUSE_NO_FLAGS, STATUS_NOT_SUPPORTED);
+-    statusReuse = WdfRequestReuse(DevCtx->Header.Request, &ReuseParams);    
+-    NT_ASSERT(NT_SUCCESS(statusReuse));
+-    UNREFERENCED_PARAMETER(statusReuse);
++    status = WdfRequestReuse(DevCtx->Header.Request, &ReuseParams);
++    if (!NT_SUCCESS(status))
++    {
++        TraceEvents(
++            TRACE_LEVEL_ERROR,
++            DBG_PNP,
++            "Unable to reuse the SDP publish request, Status code %!STATUS!\n",
++            status
++            );
++        goto exit;
++    }
+ 
+     WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(
+         &inMemDesc,
+@@ -906,15 +1664,23 @@ Return Value:
+         sizeof(HANDLE_SDP)
+         );
+ 
+-    status = WdfIoTargetSendIoctlSynchronously(
+-        DevCtx->Header.IoTarget,
+-        DevCtx->Header.Request,
+-        IOCTL_BTH_SDP_SUBMIT_RECORD,
+-        &inMemDesc,
+-        &outMemDesc,
+-        NULL,   //sendOptions
+-        NULL    //bytesReturned
+-        );
++    if (!BthEchoSrvBeginBrbSubmission(DevCtx))
++    {
++        status = STATUS_DEVICE_REMOVED;
++    }
++    else
++    {
++        status = WdfIoTargetSendIoctlSynchronously(
++            DevCtx->Header.IoTarget,
++            DevCtx->Header.Request,
++            IOCTL_BTH_SDP_SUBMIT_RECORD,
++            &inMemDesc,
++            &outMemDesc,
++            NULL,   //sendOptions
++            NULL    //bytesReturned
++            );
++        BthEchoSrvEndBrbSubmission(DevCtx);
++    }
+ 
+     if (!NT_SUCCESS(status))
+     {
+@@ -951,7 +1717,7 @@ Return Value:
+ 
+ --*/
+ {
+-    NTSTATUS status, statusReuse;
++    NTSTATUS status;
+     WDF_MEMORY_DESCRIPTOR inMemDesc;
+     WDF_REQUEST_REUSE_PARAMS ReuseParams;
+     HANDLE_SDP sdpRecordHandle;
+@@ -959,9 +1725,17 @@ Return Value:
+     PAGED_CODE();
+     
+     WDF_REQUEST_REUSE_PARAMS_INIT(&ReuseParams, WDF_REQUEST_REUSE_NO_FLAGS, STATUS_NOT_SUPPORTED);
+-    statusReuse =  WdfRequestReuse(DevCtx->Header.Request, &ReuseParams);    
+-    NT_ASSERT(NT_SUCCESS(statusReuse));
+-    UNREFERENCED_PARAMETER(statusReuse);
++    status = WdfRequestReuse(DevCtx->Header.Request, &ReuseParams);
++    if (!NT_SUCCESS(status))
++    {
++        TraceEvents(
++            TRACE_LEVEL_ERROR,
++            DBG_PNP,
++            "Unable to reuse the SDP removal request, Status code %!STATUS!\n",
++            status
++            );
++        goto exit;
++    }
+ 
+     sdpRecordHandle = DevCtx->SdpRecordHandle;
+ 
+@@ -971,26 +1745,29 @@ Return Value:
+         sizeof(HANDLE_SDP)
+         );
+     
+-    status = WdfIoTargetSendIoctlSynchronously(
+-        DevCtx->Header.IoTarget,
+-        DevCtx->Header.Request,
+-        IOCTL_BTH_SDP_REMOVE_RECORD,
+-        &inMemDesc,
+-        NULL,   //outMemDesc
+-        NULL,   //sendOptions
+-        NULL    //bytesReturned
+-        );
++    if (!BthEchoSrvBeginBrbSubmission(DevCtx))
++    {
++        status = STATUS_DEVICE_REMOVED;
++    }
++    else
++    {
++        status = WdfIoTargetSendIoctlSynchronously(
++            DevCtx->Header.IoTarget,
++            DevCtx->Header.Request,
++            IOCTL_BTH_SDP_REMOVE_RECORD,
++            &inMemDesc,
++            NULL,   //outMemDesc
++            NULL,   //sendOptions
++            NULL    //bytesReturned
++            );
++        BthEchoSrvEndBrbSubmission(DevCtx);
++    }
+ 
+     if (!NT_SUCCESS(status))
+     {
+         TraceEvents(TRACE_LEVEL_ERROR, DBG_PNP, 
+             "IOCTL_BTH_SDP_REMOVE_RECORD failed, Status code %!STATUS!\n", status);
+ 
+-        //
+-        // Send does not fail for resource reasons
+-        //
+-        NT_ASSERT(FALSE);
+-
+         goto exit;
+     }
+ 
+@@ -1037,6 +1814,7 @@ Return Value:
+     NTSTATUS status;
+     struct _BRB_L2CA_OPEN_ENHANCED_CHANNEL *brb;    
+     PBTHECHO_CONNECTION connection;
++    PBTHECHOSAMPLE_SERVER_CONTEXT devCtx;
+     WDFOBJECT connectionObject;
+ 
+ 
+@@ -1055,6 +1833,25 @@ Return Value:
+     //
+     connectionObject = (WDFOBJECT) brb->Hdr.ClientContext[0];
+     connection = GetConnectionObjectContext(connectionObject);
++    devCtx = (PBTHECHOSAMPLE_SERVER_CONTEXT)connection->DevCtxHdr;
++
++    if (NT_SUCCESS(status) &&
++        brb->Response != CONNECT_RSP_RESULT_SUCCESS)
++    {
++        status = STATUS_ACCESS_DENIED;
++    }
++    if (NT_SUCCESS(status))
++    {
++        BOOLEAN surpriseRemoved;
++
++        WdfSpinLockAcquire(devCtx->PairingStateLock);
++        surpriseRemoved = devCtx->SurpriseRemoved;
++        WdfSpinLockRelease(devCtx->PairingStateLock);
++        if (surpriseRemoved)
++        {
++            status = STATUS_DEVICE_REMOVED;
++        }
++    }
+     
+     if(NT_SUCCESS(status))
+     {
+@@ -1094,7 +1891,7 @@ Return Value:
+                 "disconnect has been received "
+                 "for connection 0x%p", connection);        
+     
+-            BthEchoConnectionObjectRemoteDisconnect(connection->DevCtxHdr, connection);
++            (void)BthEchoSrvRemoteDisconnectGuarded(devCtx, connection);
+         }
+         else
+         {
+@@ -1114,7 +1911,8 @@ Return Value:
+                 //
+                 // If the post connect processing failed, let us disconnect
+                 //
+-                BthEchoConnectionObjectRemoteDisconnect(connection->DevCtxHdr, connection);
++                BthEchoSrvDisconnectConnection(connection);
++                return;
+             }            
+ 
+         }
+@@ -1148,7 +1946,7 @@ Return Value:
+             &connection->ConnectionListEntry
+             );
+         
+-        WdfObjectDelete(connectionObject);        
++        BthEchoSrvDeleteConnectionObject(connection);
+     }
+     
+     return;    
+@@ -1184,10 +1982,25 @@ Return Value:
+     WDFOBJECT connectionObject = NULL;
+     PBTHECHO_CONNECTION connection = NULL;
+     ULONG modeConfigFlag = CM_BASIC;
++    USHORT response;
++    BOOLEAN connectionObjectReferenced = FALSE;
++    BOOLEAN surpriseRemoved;
+     
+     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_CONNECT, 
+         "Server receivced connect request");        
+ 
++    WdfSpinLockAcquire(DevCtx->PairingStateLock);
++    surpriseRemoved = DevCtx->SurpriseRemoved;
++    WdfSpinLockRelease(DevCtx->PairingStateLock);
++    if (surpriseRemoved)
++    {
++        return STATUS_DEVICE_REMOVED;
++    }
++
++    // During orderly stop, ReserveConnection returns a negative L2CAP
++    // response. Sending that response is required if an unregister failure
++    // leaves BthPort able to deliver a late connect indication.
++
+     //
+     // We create the connection object as the first step so that if we receive 
+     // remove before connect response is completed
+@@ -1204,19 +2017,35 @@ Return Value:
+         goto exit;
+     }
+ 
++    WdfObjectReference(connectionObject);
++    connectionObjectReferenced = TRUE;
+     connection = GetConnectionObjectContext(connectionObject);
+ 
+-    connection->ConnectionState = ConnectionStateConnecting;
++    connection->BrbSubmissionContext = DevCtx;
++    connection->BeginBrbSubmission =
++        BthEchoSrvConnectionBeginBrbSubmission;
++    connection->EndBrbSubmission =
++        BthEchoSrvConnectionEndBrbSubmission;
+ 
+-    //
+-    // Insert the connection object in the conenction list that we track
+-    //
+-    InsertConnectionEntryLocked(DevCtx, &connection->ConnectionListEntry);
++    connection->ConnectionState = ConnectionStateConnecting;
++    response = BthEchoSrvReserveConnection(
++        DevCtx,
++        connection,
++        ConnectParams->BtAddress,
++        ConnectParams->Parameters.Connect.Request.PSM
++        );
++    if (response != CONNECT_RSP_RESULT_SUCCESS)
++    {
++        connection->ConnectionState = ConnectionStateConnectFailed;
++    }
+ 
+     WDF_REQUEST_REUSE_PARAMS_INIT(&reuseParams, WDF_REQUEST_REUSE_NO_FLAGS, STATUS_NOT_SUPPORTED);
+     statusReuse = WdfRequestReuse(connection->ConnectDisconnectRequest, &reuseParams);
+-    NT_ASSERT(NT_SUCCESS(statusReuse));
+-    UNREFERENCED_PARAMETER(statusReuse);
++    if (!NT_SUCCESS(statusReuse))
++    {
++        status = statusReuse;
++        goto exit;
++    }
+     
+     brb = (struct _BRB_L2CA_OPEN_ENHANCED_CHANNEL*) &(connection->ConnectDisconnectBrb);
+     DevCtx->Header.ProfileDrvInterface.BthReuseBrb((PBRB)brb, BRB_L2CA_OPEN_ENHANCED_CHANNEL_RESPONSE);
+@@ -1225,7 +2054,9 @@ Return Value:
+     brb->BtAddress = ConnectParams->BtAddress;
+     brb->Psm = ConnectParams->Parameters.Connect.Request.PSM;
+     brb->ChannelHandle = ConnectParams->ConnectionHandle;
+-    brb->Response = CONNECT_RSP_RESULT_SUCCESS;
++    brb->Response = response;
++    brb->IncomingQueueDepth =
++        response == CONNECT_RSP_RESULT_SUCCESS ? 10 : 0;
+ 
+     brb->ChannelFlags = CF_ROLE_EITHER;
+ 
+@@ -1259,19 +2090,28 @@ Return Value:
+     //
+     // Get notifications about disconnect
+     //
+-    brb->CallbackFlags = CALLBACK_DISCONNECT;
++    brb->CallbackFlags =
++        response == CONNECT_RSP_RESULT_SUCCESS ? CALLBACK_DISCONNECT : 0;
+     brb->Callback = &BthEchoSrvConnectionIndicationCallback;
+     brb->CallbackContext = connectionObject;
+     brb->ReferenceObject = (PVOID) WdfDeviceWdmGetDeviceObject(DevCtx->Header.Device);
+ 
+-    status = BthEchoSharedSendBrbAsync(
+-        DevCtx->Header.IoTarget,
+-        connection->ConnectDisconnectRequest,
+-        (PBRB) brb,
+-        sizeof(*brb),
+-        BthEchoSrvRemoteConnectResponseCompletion,
+-        brb
+-        );
++    if (!BthEchoSrvBeginBrbSubmission(DevCtx))
++    {
++        status = STATUS_DEVICE_REMOVED;
++    }
++    else
++    {
++        status = BthEchoSharedSendBrbAsync(
++            DevCtx->Header.IoTarget,
++            connection->ConnectDisconnectRequest,
++            (PBRB) brb,
++            sizeof(*brb),
++            BthEchoSrvRemoteConnectResponseCompletion,
++            brb
++            );
++        BthEchoSrvEndBrbSubmission(DevCtx);
++    }
+ 
+     if (!NT_SUCCESS(status))
+     {
+@@ -1297,15 +2137,37 @@ exit:
+ 
+         if (connection != NULL)
+         {
++            BOOLEAN setDisconnectEvent;
++
++            WdfSpinLockAcquire(connection->ConnectionLock);
++            setDisconnectEvent =
++                connection->ConnectionState == ConnectionStateDisconnecting;
+             connection->ConnectionState = ConnectionStateConnectFailed;
++            WdfSpinLockRelease(connection->ConnectionLock);
++            if (setDisconnectEvent)
++            {
++                KeSetEvent(
++                    &connection->DisconnectEvent,
++                    IO_NO_INCREMENT,
++                    FALSE
++                    );
++            }
+ 
+             RemoveConnectionEntryLocked(
+                 (PBTHECHOSAMPLE_SERVER_CONTEXT) connection->DevCtxHdr,
+                 &connection->ConnectionListEntry
+                 );
++            BthEchoSrvDeleteConnectionObject(connection);
++        }
++        else
++        {
++            WdfObjectDelete(connectionObject);
+         }
++    }
+ 
+-        WdfObjectDelete(connectionObject);
++    if (connectionObjectReferenced)
++    {
++        WdfObjectDereference(connectionObject);
+     }
+     
+     return status;
+@@ -1348,6 +2210,7 @@ Return Value:
+     NTSTATUS status;
+     struct _BRB_L2CA_OPEN_CHANNEL *brb;    
+     PBTHECHO_CONNECTION connection;
++    PBTHECHOSAMPLE_SERVER_CONTEXT devCtx;
+     WDFOBJECT connectionObject;
+ 
+ 
+@@ -1366,6 +2229,25 @@ Return Value:
+     //
+     connectionObject = (WDFOBJECT) brb->Hdr.ClientContext[0];
+     connection = GetConnectionObjectContext(connectionObject);
++    devCtx = (PBTHECHOSAMPLE_SERVER_CONTEXT)connection->DevCtxHdr;
++
++    if (NT_SUCCESS(status) &&
++        brb->Response != CONNECT_RSP_RESULT_SUCCESS)
++    {
++        status = STATUS_ACCESS_DENIED;
++    }
++    if (NT_SUCCESS(status))
++    {
++        BOOLEAN surpriseRemoved;
++
++        WdfSpinLockAcquire(devCtx->PairingStateLock);
++        surpriseRemoved = devCtx->SurpriseRemoved;
++        WdfSpinLockRelease(devCtx->PairingStateLock);
++        if (surpriseRemoved)
++        {
++            status = STATUS_DEVICE_REMOVED;
++        }
++    }
+     
+     if(NT_SUCCESS(status))
+     {
+@@ -1405,7 +2287,7 @@ Return Value:
+                 "disconnect has been received "
+                 "for connection 0x%p", connection);        
+     
+-            BthEchoConnectionObjectRemoteDisconnect(connection->DevCtxHdr, connection);
++            (void)BthEchoSrvRemoteDisconnectGuarded(devCtx, connection);
+         }
+         else
+         {
+@@ -1425,7 +2307,8 @@ Return Value:
+                 //
+                 // If the post connect processing failed, let us disconnect
+                 //
+-                BthEchoConnectionObjectRemoteDisconnect(connection->DevCtxHdr, connection);
++                BthEchoSrvDisconnectConnection(connection);
++                return;
+             }            
+ 
+         }
+@@ -1459,7 +2342,7 @@ Return Value:
+             &connection->ConnectionListEntry
+             );
+         
+-        WdfObjectDelete(connectionObject);        
++        BthEchoSrvDeleteConnectionObject(connection);
+     }
+     
+     return;    
+@@ -1494,10 +2377,25 @@ Return Value:
+     struct _BRB_L2CA_OPEN_CHANNEL *brb = NULL;
+     WDFOBJECT connectionObject = NULL;
+     PBTHECHO_CONNECTION connection = NULL;
++    USHORT response;
++    BOOLEAN connectionObjectReferenced = FALSE;
++    BOOLEAN surpriseRemoved;
+     
+     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_CONNECT, 
+         "Server receivced connect request");        
+ 
++    WdfSpinLockAcquire(DevCtx->PairingStateLock);
++    surpriseRemoved = DevCtx->SurpriseRemoved;
++    WdfSpinLockRelease(DevCtx->PairingStateLock);
++    if (surpriseRemoved)
++    {
++        return STATUS_DEVICE_REMOVED;
++    }
++
++    // During orderly stop, ReserveConnection returns a negative L2CAP
++    // response. Sending that response is required if an unregister failure
++    // leaves BthPort able to deliver a late connect indication.
++
+     //
+     // We create the connection object as the first step so that if we receive 
+     // remove before connect response is completed
+@@ -1514,19 +2412,35 @@ Return Value:
+         goto exit;
+     }
+ 
++    WdfObjectReference(connectionObject);
++    connectionObjectReferenced = TRUE;
+     connection = GetConnectionObjectContext(connectionObject);
+ 
+-    connection->ConnectionState = ConnectionStateConnecting;
++    connection->BrbSubmissionContext = DevCtx;
++    connection->BeginBrbSubmission =
++        BthEchoSrvConnectionBeginBrbSubmission;
++    connection->EndBrbSubmission =
++        BthEchoSrvConnectionEndBrbSubmission;
+ 
+-    //
+-    // Insert the connection object in the conenction list that we track
+-    //
+-    InsertConnectionEntryLocked(DevCtx, &connection->ConnectionListEntry);
++    connection->ConnectionState = ConnectionStateConnecting;
++    response = BthEchoSrvReserveConnection(
++        DevCtx,
++        connection,
++        ConnectParams->BtAddress,
++        ConnectParams->Parameters.Connect.Request.PSM
++        );
++    if (response != CONNECT_RSP_RESULT_SUCCESS)
++    {
++        connection->ConnectionState = ConnectionStateConnectFailed;
++    }
+ 
+     WDF_REQUEST_REUSE_PARAMS_INIT(&reuseParams, WDF_REQUEST_REUSE_NO_FLAGS, STATUS_NOT_SUPPORTED);
+     statusReuse = WdfRequestReuse(connection->ConnectDisconnectRequest, &reuseParams);
+-    NT_ASSERT(NT_SUCCESS(statusReuse));
+-    UNREFERENCED_PARAMETER(statusReuse);
++    if (!NT_SUCCESS(statusReuse))
++    {
++        status = statusReuse;
++        goto exit;
++    }
+     
+     brb = (struct _BRB_L2CA_OPEN_CHANNEL*) &(connection->ConnectDisconnectBrb);
+     DevCtx->Header.ProfileDrvInterface.BthReuseBrb((PBRB)brb, BRB_L2CA_OPEN_CHANNEL_RESPONSE);
+@@ -1535,7 +2449,9 @@ Return Value:
+     brb->BtAddress = ConnectParams->BtAddress;
+     brb->Psm = ConnectParams->Parameters.Connect.Request.PSM;
+     brb->ChannelHandle = ConnectParams->ConnectionHandle;
+-    brb->Response = CONNECT_RSP_RESULT_SUCCESS;
++    brb->Response = response;
++    brb->IncomingQueueDepth =
++        response == CONNECT_RSP_RESULT_SUCCESS ? 10 : 0;
+ 
+     brb->ChannelFlags = CF_ROLE_EITHER;
+ 
+@@ -1555,19 +2471,28 @@ Return Value:
+     //
+     // Get notifications about disconnect
+     //
+-    brb->CallbackFlags = CALLBACK_DISCONNECT;
++    brb->CallbackFlags =
++        response == CONNECT_RSP_RESULT_SUCCESS ? CALLBACK_DISCONNECT : 0;
+     brb->Callback = &BthEchoSrvConnectionIndicationCallback;
+     brb->CallbackContext = connectionObject;
+     brb->ReferenceObject = (PVOID) WdfDeviceWdmGetDeviceObject(DevCtx->Header.Device);
+ 
+-    status = BthEchoSharedSendBrbAsync(
+-        DevCtx->Header.IoTarget,
+-        connection->ConnectDisconnectRequest,
+-        (PBRB) brb,
+-        sizeof(*brb),
+-        BthEchoSrvRemoteConnectResponseCompletion,
+-        brb
+-        );
++    if (!BthEchoSrvBeginBrbSubmission(DevCtx))
++    {
++        status = STATUS_DEVICE_REMOVED;
++    }
++    else
++    {
++        status = BthEchoSharedSendBrbAsync(
++            DevCtx->Header.IoTarget,
++            connection->ConnectDisconnectRequest,
++            (PBRB) brb,
++            sizeof(*brb),
++            BthEchoSrvRemoteConnectResponseCompletion,
++            brb
++            );
++        BthEchoSrvEndBrbSubmission(DevCtx);
++    }
+ 
+     if (!NT_SUCCESS(status))
+     {
+@@ -1593,15 +2518,37 @@ exit:
+ 
+         if (connection != NULL)
+         {
++            BOOLEAN setDisconnectEvent;
++
++            WdfSpinLockAcquire(connection->ConnectionLock);
++            setDisconnectEvent =
++                connection->ConnectionState == ConnectionStateDisconnecting;
+             connection->ConnectionState = ConnectionStateConnectFailed;
++            WdfSpinLockRelease(connection->ConnectionLock);
++            if (setDisconnectEvent)
++            {
++                KeSetEvent(
++                    &connection->DisconnectEvent,
++                    IO_NO_INCREMENT,
++                    FALSE
++                    );
++            }
+ 
+             RemoveConnectionEntryLocked(
+                 (PBTHECHOSAMPLE_SERVER_CONTEXT) connection->DevCtxHdr,
+                 &connection->ConnectionListEntry
+                 );
++            BthEchoSrvDeleteConnectionObject(connection);
++        }
++        else
++        {
++            WdfObjectDelete(connectionObject);
+         }
++    }
+ 
+-        WdfObjectDelete(connectionObject);
++    if (connectionObjectReferenced)
++    {
++        WdfObjectDereference(connectionObject);
+     }
+     
+     return status;
+@@ -1630,10 +2577,21 @@ Arguments:
+ 
+ --*/
+ {
+-    WDFOBJECT connectionObject;
++    BOOLEAN deleteConnection;
++    BOOLEAN initiated;
++    BOOLEAN surpriseRemoved;
++    PBTHECHOSAMPLE_SERVER_CONTEXT devCtx =
++        (PBTHECHOSAMPLE_SERVER_CONTEXT)Connection->DevCtxHdr;
++
++    // Serialize teardown intent with bridge publication. If publication wins,
++    // BridgeConnectionRemoved below clears it; if this mark wins, Added/Ready
++    // reject the doomed object.
++    WdfSpinLockAcquire(devCtx->ConnectionListLock);
++    Connection->TeardownRequested = TRUE;
++    WdfSpinLockRelease(devCtx->ConnectionListLock);
+ 
+     SplatplostBridgeConnectionRemoved(
+-        (PBTHECHOSAMPLE_SERVER_CONTEXT)Connection->DevCtxHdr,
++        devCtx,
+         Connection
+         );
+ 
+@@ -1641,16 +2599,27 @@ Arguments:
+     // If BthEchoConnectionObjectRemoteDisconnect returns FALSE
+     // connection is already disconnected
+     // 
+-    if (BthEchoConnectionObjectRemoteDisconnect(Connection->DevCtxHdr, Connection))
++    initiated = BthEchoSrvRemoteDisconnectGuarded(devCtx, Connection);
++    WdfSpinLockAcquire(devCtx->PairingStateLock);
++    surpriseRemoved = devCtx->SurpriseRemoved;
++    WdfSpinLockRelease(devCtx->PairingStateLock);
++    deleteConnection = initiated || surpriseRemoved;
++    if (!deleteConnection)
++    {
++        WdfSpinLockAcquire(Connection->ConnectionLock);
++        deleteConnection =
++            Connection->ConnectionState == ConnectionStateDisconnected ||
++            Connection->ConnectionState == ConnectionStateConnectFailed;
++        WdfSpinLockRelease(Connection->ConnectionLock);
++    }
++    if (deleteConnection)
+     {
+         RemoveConnectionEntryLocked(
+             (PBTHECHOSAMPLE_SERVER_CONTEXT) Connection->DevCtxHdr,
+             &Connection->ConnectionListEntry
+             );
+ 
+-        connectionObject = WdfObjectContextGetObject(Connection);
+-
+-        WdfObjectDelete(connectionObject);    
++        BthEchoSrvDeleteConnectionObject(Connection);
+     }
+ }
+ 
+@@ -1703,9 +2672,10 @@ Arguments:
+ 
+         ple = DevCtx->ConnectionList.Flink;
+ 
+-        RemoveEntryList(ple);
+-
+         connection = CONTAINING_RECORD(ple, BTHECHO_CONNECTION, ConnectionListEntry);
++        RemoveEntryList(ple);
++        InitializeListHead(ple);
++        connection->InConnectionList = FALSE;
+ 
+         //
+         // Add a reference since we will be touching connection object
+@@ -1721,7 +2691,7 @@ Arguments:
+         // that we send disconnect only once
+         //
+         SplatplostBridgeConnectionRemoved(DevCtx, connection);
+-        BthEchoConnectionObjectRemoteDisconnect(&DevCtx->Header, connection);
++        (void)BthEchoSrvRemoteDisconnectGuarded(DevCtx, connection);
+ 
+         //
+         // Release the reference added above
+@@ -1735,3 +2705,46 @@ Arguments:
+     }
+ }    
+ 
++_IRQL_requires_max_(DISPATCH_LEVEL)
++VOID
++BthEchoSrvAbandonConnectionsOnSurpriseRemoval(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx
++    )
++{
++    for (;;)
++    {
++        PLIST_ENTRY entry;
++        PBTHECHO_CONNECTION connection;
++        WDFOBJECT connectionObject;
++
++        WdfSpinLockAcquire(DevCtx->ConnectionListLock);
++        if (IsListEmpty(&DevCtx->ConnectionList))
++        {
++            DevCtx->ControlConnection = NULL;
++            DevCtx->InterruptConnection = NULL;
++            DevCtx->BridgeRemoteAddress = BTH_ADDR_NULL;
++            DevCtx->PacketFifoHead = 0;
++            DevCtx->PacketFifoTail = 0;
++            DevCtx->PacketFifoCount = 0;
++            WdfSpinLockRelease(DevCtx->ConnectionListLock);
++            break;
++        }
++
++        entry = DevCtx->ConnectionList.Flink;
++        connection = CONTAINING_RECORD(
++            entry,
++            BTHECHO_CONNECTION,
++            ConnectionListEntry
++            );
++        RemoveEntryList(entry);
++        InitializeListHead(entry);
++        connection->InConnectionList = FALSE;
++        connection->TeardownRequested = TRUE;
++        connectionObject = WdfObjectContextGetObject(connection);
++        WdfObjectReference(connectionObject);
++        WdfSpinLockRelease(DevCtx->ConnectionListLock);
++
++        SplatplostBridgeAbandonConnection(DevCtx, connection);
++        WdfObjectDereference(connectionObject);
++    }
++}
+diff --git a/bluetooth/bthecho/bthsrv/sys/server.h b/bluetooth/bthecho/bthsrv/sys/server.h
+index 85d598c9..cd0ef8a0 100644
+--- a/bluetooth/bthecho/bthsrv/sys/server.h
++++ b/bluetooth/bthecho/bthsrv/sys/server.h
+@@ -46,6 +46,39 @@ BthEchoSrvStopPairingRegistration(
+     _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx
+     );
+ 
++_IRQL_requires_max_(DISPATCH_LEVEL)
++BOOLEAN
++BthEchoSrvBeginBrbSubmission(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx
++    );
++
++_IRQL_requires_max_(DISPATCH_LEVEL)
++VOID
++BthEchoSrvEndBrbSubmission(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx
++    );
++
++_IRQL_requires_max_(PASSIVE_LEVEL)
++NTSTATUS
++BthEchoSrvRegisterDeviceServersLocked(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
++    _In_ BTH_ADDR BtAddress
++    );
++
++_IRQL_requires_max_(PASSIVE_LEVEL)
++NTSTATUS
++BthEchoSrvLoadPersistedAddress(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
++    _Out_ BTH_ADDR *BtAddress
++    );
++
++_IRQL_requires_max_(DISPATCH_LEVEL)
++VOID
++BthEchoSrvQueueProvenAddress(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
++    _In_ BTH_ADDR BtAddress
++    );
++
+ _IRQL_requires_max_(PASSIVE_LEVEL)
+ NTSTATUS
+ BthEchoSrvPublishSdpRecord(
+@@ -79,5 +112,11 @@ BthEchoSrvDisconnectConnectionsOnRemove(
+     _In_ PBTHECHOSAMPLE_SERVER_CONTEXT devCtx
+     );
+ 
++_IRQL_requires_max_(DISPATCH_LEVEL)
++VOID
++BthEchoSrvAbandonConnectionsOnSurpriseRemoval(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx
++    );
++
+ EVT_WDF_REQUEST_COMPLETION_ROUTINE BthEchoSrvRemoteConnectResponseCompletion;
+ 
+diff --git a/bluetooth/bthecho/common/inc/connection.h b/bluetooth/bthecho/common/inc/connection.h
+index b826b9f1..8e8a8322 100644
+--- a/bluetooth/bthecho/common/inc/connection.h
++++ b/bluetooth/bthecho/common/inc/connection.h
+@@ -23,7 +23,7 @@ Environment:
+ 
+ typedef struct _BTHECHO_CONNECTION * PBTHECHO_CONNECTION;
+ 
+-#define BTHECHOSAMPLE_NUM_CONTINUOUS_READERS 2
++#define BTHECHOSAMPLE_NUM_CONTINUOUS_READERS 1
+ 
+ typedef VOID
+ (*PFN_BTHECHO_CONNECTION_OBJECT_CONTREADER_READ_COMPLETE) (
+@@ -39,6 +39,16 @@ typedef VOID
+     _In_ PBTHECHO_CONNECTION Connection
+     );
+ 
++typedef BOOLEAN
++(*PFN_BTHECHO_BEGIN_BRB_SUBMISSION) (
++    _In_ PVOID Context
++    );
++
++typedef VOID
++(*PFN_BTHECHO_END_BRB_SUBMISSION) (
++    _In_ PVOID Context
++    );
++
+ 
+ typedef struct _BTHECHO_REPEAT_READER
+ {
+@@ -57,10 +67,14 @@ typedef struct _BTHECHO_REPEAT_READER
+     //
+     WDFMEMORY MemoryPendingRead;
+ 
++    // Stable wrapper for TransferBrb across request reuse/resubmission.
++    WDFMEMORY MemoryTransferBrb;
++
+     //
+     // Dpc for resubmitting pending read
+     //
+     KDPC ResubmitDpc;
++    KDPC FailureDpc;
+ 
+     //
+     // Whether the continuous reader is transitioning to stopped state
+@@ -72,6 +86,11 @@ typedef struct _BTHECHO_REPEAT_READER
+     // Event used to wait for read completion while stopping the continuos reader
+     //
+     KEVENT StopEvent;
++
++    // A sent request can complete and queue its resubmit DPC before the
++    // current Submit call has returned. Cleanup waits for this per-reader
++    // rundown so it cannot mutate/delete the request under that caller.
++    EX_RUNDOWN_REF SubmissionRundown;
+     
+     //
+     // Back pointer to connection
+@@ -120,6 +139,16 @@ typedef struct _BTHECHO_CONNECTION {
+     // List entry for connection list maintained at device level
+     //
+     LIST_ENTRY                              ConnectionListEntry;
++    BOOLEAN                                 InConnectionList;
++    BOOLEAN                                 TeardownRequested;
++    BOOLEAN                                 BridgeReaderReady;
++    LONG                                    DeleteRequested;
++
++    // Optional server-side gate used by continuous-reader resubmissions so a
++    // surprise-removal callback can prevent every new profile BRB submission.
++    PVOID                                   BrbSubmissionContext;
++    PFN_BTHECHO_BEGIN_BRB_SUBMISSION        BeginBrbSubmission;
++    PFN_BTHECHO_END_BRB_SUBMISSION          EndBrbSubmission;
+ 
+     PBTHECHOSAMPLE_DEVICE_CONTEXT_HEADER    DevCtxHdr;    
+ 
+@@ -205,13 +234,13 @@ BthEchoConnectionObjectRemoteDisconnectSynchronously(
+     );
+ 
+ _IRQL_requires_max_(DISPATCH_LEVEL)
+-_When_(return==0, _At_(*Brb, __drv_allocatesMem(Mem)))
+ NTSTATUS
+ BthEchoConnectionObjectFormatRequestForL2CaTransfer(
+     _In_ PBTHECHO_CONNECTION Connection,
+     _In_ WDFREQUEST Request,
+     _Inout_ struct _BRB_L2CA_ACL_TRANSFER ** Brb,
+     _In_ WDFMEMORY Memory,
++    _In_opt_ WDFMEMORY BrbMemory,
+     _In_ ULONG TransferFlags //flags include direction of transfer
+     );
+ 
+diff --git a/bluetooth/bthecho/common/lib/connection.c b/bluetooth/bthecho/common/lib/connection.c
+index 36734a06..04a1fa19 100644
+--- a/bluetooth/bthecho/common/lib/connection.c
++++ b/bluetooth/bthecho/common/lib/connection.c
+@@ -100,20 +100,85 @@ Arguments:
+     repeatReader =
+         (PBTHECHO_REPEAT_READER) SystemArgument1;
+ 
+-    //
+-    // BthEchoRepeatReaderSubmit will invoke contreader
+-    // failure callback in case of failure
+-    // so we don't check for failure here
+-    //
+     if ((NULL != DeferredContext) && (NULL != repeatReader))
+     {
+-        (void) BthEchoRepeatReaderSubmit(
++        NTSTATUS status;
++
++        // Hold an outer rundown reference across Submit and any failure
++        // callback. Submit can signal StopEvent before returning; without
++        // this outer reference an already-waiting cleanup could destroy the
++        // reader before this DPC reports that failure.
++        if (!ExAcquireRundownProtection(&repeatReader->SubmissionRundown))
++        {
++            KeSetEvent(
++                &repeatReader->StopEvent,
++                IO_NO_INCREMENT,
++                FALSE
++                );
++            return;
++        }
++
++        status = BthEchoRepeatReaderSubmit(
+             (PBTHECHOSAMPLE_DEVICE_CONTEXT_HEADER) DeferredContext,
+             repeatReader
+-            ); 
++            );
++
++        if (!NT_SUCCESS(status) && status != STATUS_DELETE_PENDING)
++        {
++            PBTHECHO_CONNECTION connection = repeatReader->Connection;
++
++            // Submit has already signaled StopEvent and released its inner
++            // rundown reference. The outer reference keeps the reader alive,
++            // and this DISPATCH_LEVEL callback defers WdfObjectDelete cleanup.
++            connection->ContinuousReader.
++                BthEchoConnectionObjectContReaderFailedCallback(
++                    connection->DevCtxHdr,
++                    connection
++                    );
++            ExReleaseRundownProtection(&repeatReader->SubmissionRundown);
++            // The release can unblock cleanup; do not touch the reader again.
++            return;
++        }
++
++        ExReleaseRundownProtection(&repeatReader->SubmissionRundown);
+     }
+ }
+ 
++KDEFERRED_ROUTINE
++BthEchoRepeatReaderFailureDpc;
++
++VOID
++BthEchoRepeatReaderFailureDpc(
++    _In_ struct _KDPC *Dpc,
++    _In_opt_ PVOID DeferredContext,
++    _In_opt_ PVOID SystemArgument1,
++    _In_opt_ PVOID SystemArgument2
++    )
++{
++    PBTHECHO_REPEAT_READER repeatReader =
++        (PBTHECHO_REPEAT_READER)SystemArgument1;
++    PBTHECHO_CONNECTION connection;
++
++    UNREFERENCED_PARAMETER(Dpc);
++    UNREFERENCED_PARAMETER(DeferredContext);
++    UNREFERENCED_PARAMETER(SystemArgument2);
++
++    if (repeatReader == NULL)
++    {
++        return;
++    }
++
++    connection = repeatReader->Connection;
++    connection->ContinuousReader.
++        BthEchoConnectionObjectContReaderFailedCallback(
++            connection->DevCtxHdr,
++            connection
++            );
++    // A DISPATCH_LEVEL delete is deferred. Signal passive cleanup only after
++    // the callback has finished using the connection, then return immediately.
++    KeSetEvent(&repeatReader->StopEvent, IO_NO_INCREMENT, FALSE);
++}
++
+ EVT_WDF_REQUEST_COMPLETION_ROUTINE
+ BthEchoRepeatReaderPendingReadCompletion;
+ 
+@@ -186,38 +251,62 @@ Arguments:
+ 
+     if (!NT_SUCCESS(status))
+     {
+-        //
+-        // Invoke reader failed callback only if status is something other
+-        // than cancelled. If the status is STATUS_CANCELLED this is because
+-        // we have cancelled repeat reader.
+-        //
+-        if (STATUS_CANCELLED != status)
+-        {       
+-            //
+-            // Invoke reader failed callback before setting the stop event
+-            // to ensure that connection object is alive during this callback
+-            //
+-            repeatReader->Connection->ContinuousReader.BthEchoConnectionObjectContReaderFailedCallback(
+-                repeatReader->Connection->DevCtxHdr, 
+-                repeatReader->Connection
++        if (STATUS_CANCELLED == status)
++        {
++            KeSetEvent(&repeatReader->StopEvent, 0, FALSE);
++            return;
++        }
++
++        // A completion callback can run at PASSIVE_LEVEL. Calling the failure
++        // callback inline could synchronously delete the connection and make
++        // its passive cleanup wait on this very callback. Use a separate DPC;
++        // the resubmit DPC can still be returning from the failed request.
++        {
++            BOOLEAN ret = KeInsertQueueDpc(
++                &repeatReader->FailureDpc,
++                repeatReader,
++                NULL
+                 );
++            NT_ASSERT(TRUE == ret);
++            if (!ret)
++            {
++                TraceEvents(
++                    TRACE_LEVEL_ERROR,
++                    DBG_CONT_READER,
++                    "Unable to queue the continuous-reader failure DPC"
++                    );
++                KeSetEvent(&repeatReader->StopEvent, 0, FALSE);
++            }
+         }
+-            
+-        //
+-        // Set stop event because we are not resubmitting the reader
+-        //
+-        KeSetEvent(&repeatReader->StopEvent, 0, FALSE);        
++        return;
+     }
+-    else
+-    {
+-        //
+-        // Resubmit pending read
+-        // We use a Dpc to avoid recursing in this completion routine
+-        //
+ 
+-        BOOLEAN ret = KeInsertQueueDpc(&repeatReader->ResubmitDpc, repeatReader, NULL);
+-        NT_ASSERT (TRUE == ret); //we only expect one outstanding dpc
+-        UNREFERENCED_PARAMETER(ret); //ret remains unused in fre build
++    // Resubmit successful reads from a DPC to avoid recursion.
++    {
++        BOOLEAN ret = KeInsertQueueDpc(
++            &repeatReader->ResubmitDpc,
++            repeatReader,
++            NULL
++            );
++        NT_ASSERT(TRUE == ret); // only one request exists for this reader
++        if (!ret)
++        {
++            TraceEvents(
++                TRACE_LEVEL_ERROR,
++                DBG_CONT_READER,
++                "Unable to queue the continuous-reader resubmit DPC"
++                );
++            ret = KeInsertQueueDpc(
++                &repeatReader->FailureDpc,
++                repeatReader,
++                NULL
++                );
++            NT_ASSERT(TRUE == ret);
++            if (!ret)
++            {
++                KeSetEvent(&repeatReader->StopEvent, 0, FALSE);
++            }
++        }
+     }
+ }
+ 
+@@ -291,8 +380,8 @@ Return Value:
+     if (BufferSize <= 0)
+     {
+         TraceEvents(TRACE_LEVEL_ERROR, DBG_CONT_READER,
+-            "BufferSize has an invalid value: %I64d\n",
+-            BufferSize
++            "BufferSize has an invalid value: %I64u\n",
++            (ULONGLONG)BufferSize
+             );
+ 
+         status = STATUS_INVALID_PARAMETER;
+@@ -326,6 +415,26 @@ Return Value:
+         goto exit;
+     }
+ 
++    // The request is reused for every inbound report. Keep exactly one child
++    // WDFMEMORY wrapper for its embedded BRB instead of allocating another
++    // framework object on every resubmission.
++    status = WdfMemoryCreatePreallocated(
++        &attributes,
++        &RepeatReader->TransferBrb,
++        sizeof(RepeatReader->TransferBrb),
++        &RepeatReader->MemoryTransferBrb
++        );
++    if (!NT_SUCCESS(status))
++    {
++        TraceEvents(
++            TRACE_LEVEL_ERROR,
++            DBG_CONT_READER,
++            "Creating reusable BRB memory failed, Status code %!STATUS!\n",
++            status
++            );
++        goto exit;
++    }
++
+     //
+     // Initialize Dpc that we will use for resubmitting pending read
+     //
+@@ -334,6 +443,11 @@ Return Value:
+         BthEchoRepeatReaderResubmitReadDpc, 
+         Connection->DevCtxHdr
+         );
++    KeInitializeDpc(
++        &RepeatReader->FailureDpc,
++        BthEchoRepeatReaderFailureDpc,
++        Connection->DevCtxHdr
++        );
+ 
+     //
+     // Initialize event used to wait for stop.
+@@ -341,6 +455,7 @@ Return Value:
+     // request is submitted.
+     //
+     KeInitializeEvent(&RepeatReader->StopEvent, NotificationEvent, TRUE);
++    ExInitializeRundownProtection(&RepeatReader->SubmissionRundown);
+ 
+     RepeatReader->Connection = Connection;
+     
+@@ -378,16 +493,25 @@ Return Value:
+ 
+ --*/
+ {
+-    NTSTATUS status, statusReuse;
++    NTSTATUS status;
++    BOOLEAN brbSubmissionStarted = FALSE;
++    BOOLEAN requestSent;
+     WDF_REQUEST_REUSE_PARAMS reuseParams;
+     struct _BRB_L2CA_ACL_TRANSFER *brb = &RepeatReader->TransferBrb;    
+ 
+-    DevCtxHdr->ProfileDrvInterface.BthReuseBrb((PBRB)brb, BRB_L2CA_ACL_TRANSFER);
++    if (!ExAcquireRundownProtection(&RepeatReader->SubmissionRundown))
++    {
++        KeSetEvent(&RepeatReader->StopEvent, IO_NO_INCREMENT, FALSE);
++        return STATUS_DELETE_PENDING;
++    }
++    KeClearEvent(&RepeatReader->StopEvent);
+ 
+     WDF_REQUEST_REUSE_PARAMS_INIT(&reuseParams, WDF_REQUEST_REUSE_NO_FLAGS, STATUS_UNSUCCESSFUL);
+-    statusReuse = WdfRequestReuse(RepeatReader->RequestPendingRead, &reuseParams);
+-    NT_ASSERT(NT_SUCCESS(statusReuse));
+-    UNREFERENCED_PARAMETER(statusReuse);
++    status = WdfRequestReuse(RepeatReader->RequestPendingRead, &reuseParams);
++    if (!NT_SUCCESS(status))
++    {
++        goto exit;
++    }
+ 
+     //
+     // Check if we are stopping, if yes set StopEvent and exit.
+@@ -417,6 +541,7 @@ Return Value:
+         RepeatReader->RequestPendingRead,
+         &brb,
+         RepeatReader->MemoryPendingRead,
++        RepeatReader->MemoryTransferBrb,
+         ACL_TRANSFER_DIRECTION_IN | ACL_SHORT_TRANSFER_OK
+         );
+ 
+@@ -435,20 +560,39 @@ Return Value:
+         RepeatReader
+         );
+ 
+-    //
+-    // Clear the stop event before sending the request
+-    // This is relevant only on start of the repeat reader 
+-    // (i.e. the first submission)
+-    // this event eventually gets set only when repeat reader stops
+-    // and not on every resubmission.
+-    //
+-    KeClearEvent(&RepeatReader->StopEvent);
++    if (RepeatReader->Connection->BeginBrbSubmission != NULL)
++    {
++        if (!RepeatReader->Connection->BeginBrbSubmission(
++                RepeatReader->Connection->BrbSubmissionContext))
++        {
++            status = STATUS_DEVICE_REMOVED;
++            goto exit;
++        }
++        brbSubmissionStarted = TRUE;
++    }
+ 
+-    if (FALSE == WdfRequestSend(
++    requestSent = WdfRequestSend(
+         RepeatReader->RequestPendingRead,
+         DevCtxHdr->IoTarget,
+         NULL
+-        ))
++        );
++
++    // Close the race where cancellation marks Stopping after the pre-send
++    // check but before the request becomes cancelable as a sent request.
++    if (requestSent &&
++        InterlockedCompareExchange(&RepeatReader->Stopping, 0, 0) != 0)
++    {
++        WdfRequestCancelSentRequest(RepeatReader->RequestPendingRead);
++    }
++
++    if (brbSubmissionStarted)
++    {
++        RepeatReader->Connection->EndBrbSubmission(
++            RepeatReader->Connection->BrbSubmissionContext
++            );
++    }
++
++    if (FALSE == requestSent)
+     {
+         status = WdfRequestGetStatus(RepeatReader->RequestPendingRead);
+ 
+@@ -473,22 +617,14 @@ Return Value:
+ exit:
+     if (!NT_SUCCESS(status))
+     {
+-        //
+-        // Invoke the reader failed callback before setting the event
+-        // to ensure that the connection object is alive during this callback
+-        //
+-        RepeatReader->Connection->ContinuousReader.BthEchoConnectionObjectContReaderFailedCallback(
+-            RepeatReader->Connection->DevCtxHdr, 
+-            RepeatReader->Connection
+-            );
+-
+-        //
+-        // If we failed to send pending read, set the event since
+-        // we will not get completion callback
+-        //
+-            
++        // The caller decides how to report failure. Release every resource a
++        // passive cleanup may wait for before returning.
+         KeSetEvent(&RepeatReader->StopEvent, 0, FALSE);
++        ExReleaseRundownProtection(&RepeatReader->SubmissionRundown);
++        return status;
+     }
++
++    ExReleaseRundownProtection(&RepeatReader->SubmissionRundown);
+     
+     return status;
+ }
+@@ -744,6 +880,7 @@ Arguments:
+     {
+         PBTHECHO_REPEAT_READER repeatReader = &Connection->ContinuousReader.RepeatReaders[i];
+ 
++        ExWaitForRundownProtectionRelease(&repeatReader->SubmissionRundown);
+         BthEchoRepeatReaderWaitForStop(repeatReader); //It is OK to wait on unsubmitted readers
+         BthEchoRepeatReaderUninitialize(repeatReader);
+     }    
+@@ -790,7 +927,10 @@ Return Value:
+         FALSE,
+         NULL);
+ 
+-    WdfObjectDelete(connection->ConnectDisconnectRequest);
++    if (connection->ConnectDisconnectRequest != NULL)
++    {
++        WdfObjectDelete(connection->ConnectDisconnectRequest);
++    }
+ }
+ #pragma warning(pop) // enable 28118 again
+ 
+@@ -822,8 +962,19 @@ Return Value:
+     WDF_OBJECT_ATTRIBUTES attributes;
+     PBTHECHO_CONNECTION connection = GetConnectionObjectContext(ConnectionObject);
+ 
+-    
++    // Cleanup is installed before this initializer runs. Make every resource
++    // that cleanup touches valid before the first fallible allocation.
++    connection->ConnectDisconnectRequest = NULL;
++    KeInitializeEvent(&connection->DisconnectEvent, NotificationEvent, TRUE);
++
+     connection->DevCtxHdr = DevCtxHdr;
++    connection->InConnectionList = FALSE;
++    connection->TeardownRequested = FALSE;
++    connection->BridgeReaderReady = FALSE;
++    connection->DeleteRequested = 0;
++    connection->BrbSubmissionContext = NULL;
++    connection->BeginBrbSubmission = NULL;
++    connection->EndBrbSubmission = NULL;
+ 
+     connection->ConnectionState = ConnectionStateInitialized;
+ 
+@@ -858,12 +1009,6 @@ Return Value:
+         return status;
+     }
+ 
+-    //
+-    // Initialize event
+-    //
+-    
+-    KeInitializeEvent(&connection->DisconnectEvent, NotificationEvent, TRUE);
+-
+     //
+     // Initalize list entry
+     //
+@@ -1030,6 +1175,8 @@ Return Value:
+ --*/
+ {
+     struct _BRB_L2CA_CLOSE_CHANNEL * disconnectBrb;
++    NTSTATUS status;
++    WDF_REQUEST_REUSE_PARAMS reuseParams;
+ 
+     //
+     // Cancel continuous readers for the connection
+@@ -1078,6 +1225,24 @@ Return Value:
+ 
+     KeClearEvent(&Connection->DisconnectEvent);
+ 
++    WDF_REQUEST_REUSE_PARAMS_INIT(
++        &reuseParams,
++        WDF_REQUEST_REUSE_NO_FLAGS,
++        STATUS_NOT_SUPPORTED
++        );
++    status = WdfRequestReuse(
++        Connection->ConnectDisconnectRequest,
++        &reuseParams
++        );
++    if (!NT_SUCCESS(status))
++    {
++        WdfSpinLockAcquire(Connection->ConnectionLock);
++        Connection->ConnectionState = ConnectionStateDisconnected;
++        WdfSpinLockRelease(Connection->ConnectionLock);
++        KeSetEvent(&Connection->DisconnectEvent, IO_NO_INCREMENT, FALSE);
++        return TRUE;
++    }
++
+     DevCtxHdr->ProfileDrvInterface.BthReuseBrb(&Connection->ConnectDisconnectBrb, BRB_L2CA_CLOSE_CHANNEL);
+ 
+     disconnectBrb = (struct _BRB_L2CA_CLOSE_CHANNEL *) &(Connection->ConnectDisconnectBrb);
+@@ -1090,7 +1255,7 @@ Return Value:
+     // disconnected, hence we don't assert for success
+     //
+ 
+-    (void) BthEchoSharedSendBrbAsync(
++    status = BthEchoSharedSendBrbAsync(
+         DevCtxHdr->IoTarget, 
+         Connection->ConnectDisconnectRequest, 
+         (PBRB) disconnectBrb,
+@@ -1099,6 +1264,17 @@ Return Value:
+         Connection
+         );    
+ 
++    if (!NT_SUCCESS(status))
++    {
++        // No completion callback will arrive after an immediate submission
++        // failure. Complete the state transition here so object cleanup cannot
++        // wait forever on DisconnectEvent.
++        WdfSpinLockAcquire(Connection->ConnectionLock);
++        Connection->ConnectionState = ConnectionStateDisconnected;
++        WdfSpinLockRelease(Connection->ConnectionLock);
++        KeSetEvent(&Connection->DisconnectEvent, IO_NO_INCREMENT, FALSE);
++    }
++
+     return TRUE;
+ }
+ 
+@@ -1139,7 +1315,8 @@ FormatRequestWithBrb(
+     _In_ WDFIOTARGET IoTarget,
+     _In_ WDFREQUEST Request,
+     _In_ PBRB Brb,
+-    _In_ size_t BrbSize
++    _In_ size_t BrbSize,
++    _In_opt_ WDFMEMORY ExistingMemory
+     )
+ /*++
+ 
+@@ -1158,13 +1335,15 @@ Arguments:
+ {
+     NTSTATUS status         = BTH_ERROR_SUCCESS;
+     WDF_OBJECT_ATTRIBUTES attributes;
+-    WDFMEMORY memoryArg1    = NULL;
++    WDFMEMORY memoryArg1    = ExistingMemory;
++    PVOID existingBuffer;
++    size_t existingSize;
+ 
+     if (BrbSize <= 0) 
+     {        
+         TraceEvents(TRACE_LEVEL_ERROR, DBG_UTIL, 
+-            "BrbSize has an invalid value: %I64d\n",
+-            BrbSize
++            "BrbSize has an invalid value: %I64u\n",
++            (ULONGLONG)BrbSize
+             );
+ 
+         status = STATUS_INVALID_PARAMETER;
+@@ -1172,15 +1351,24 @@ Arguments:
+         goto exit;
+     }
+ 
+-    WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
+-    attributes.ParentObject = Request;
++    if (memoryArg1 == NULL)
++    {
++        WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
++        attributes.ParentObject = Request;
+ 
+-    status = WdfMemoryCreatePreallocated(
+-        &attributes,
+-        Brb,
+-        BrbSize,
+-        &memoryArg1
+-        );
++        status = WdfMemoryCreatePreallocated(
++            &attributes,
++            Brb,
++            BrbSize,
++            &memoryArg1
++            );
++    }
++    else
++    {
++        existingBuffer = WdfMemoryGetBuffer(memoryArg1, &existingSize);
++        status = existingBuffer == Brb && existingSize >= BrbSize ?
++            STATUS_SUCCESS : STATUS_INVALID_PARAMETER;
++    }
+ 
+     if (!NT_SUCCESS(status))
+     {
+@@ -1223,13 +1411,13 @@ exit:
+ }
+ 
+ _IRQL_requires_max_(DISPATCH_LEVEL)
+-_When_(return==0, _At_(*Brb, __drv_allocatesMem(Mem)))
+ NTSTATUS
+ BthEchoConnectionObjectFormatRequestForL2CaTransfer(
+     _In_ PBTHECHO_CONNECTION Connection,
+     _In_ WDFREQUEST Request,
+     _Inout_ struct _BRB_L2CA_ACL_TRANSFER ** Brb,
+     _In_ WDFMEMORY Memory,
++    _In_opt_ WDFMEMORY BrbMemory,
+     _In_ ULONG TransferFlags //flags include direction of transfer
+     )
+ /*++
+@@ -1321,7 +1509,8 @@ Return Value:
+         Connection->DevCtxHdr->IoTarget,
+         Request,
+         (PBRB) brb,
+-        sizeof(*brb)
++        sizeof(*brb),
++        BrbMemory
+         );
+     
+     if (!NT_SUCCESS(status))
+diff --git a/bluetooth/bthecho/common/lib/clisrv.c b/bluetooth/bthecho/common/lib/clisrv.c
+index c5e22414..0a834710 100644
+--- a/bluetooth/bthecho/common/lib/clisrv.c
++++ b/bluetooth/bthecho/common/lib/clisrv.c
+@@ -274,8 +274,8 @@ Notes:
+     if (BrbSize <= 0)
+     {
+         TraceEvents(TRACE_LEVEL_ERROR, DBG_CONT_READER,
+-            "BrbSize has invalid value: %I64d\n",
+-            BrbSize
++            "BrbSize has invalid value: %I64u\n",
++            (ULONGLONG)BrbSize
+             );
+ 
+         status = STATUS_INVALID_PARAMETER;
+diff --git a/bluetooth/bthecho/bthsrv/sys/bridge.c b/bluetooth/bthecho/bthsrv/sys/bridge.c
+index 43e3fdf..2f42215 100644
+--- a/bluetooth/bthecho/bthsrv/sys/bridge.c
++++ b/bluetooth/bthecho/bthsrv/sys/bridge.c
+@@ -18,6 +18,60 @@ SplatplostResetPacketFifoLocked(
+     DevCtx->PacketFifoCount = 0;
+ }
+ 
++#define SPLATPLOST_CLEANUP_CONNECTION_CAPACITY 4
++
++_IRQL_requires_max_(DISPATCH_LEVEL)
++static VOID
++SplatplostReferenceConnectionForCleanupLocked(
++    _In_ WDFOBJECT ConnectionObject,
++    _Inout_updates_(ConnectionObjectCapacity)
++        WDFOBJECT *ConnectionObjects,
++    _In_ ULONG ConnectionObjectCapacity,
++    _Inout_ PULONG ConnectionObjectCount
++    )
++{
++    PBTHECHO_CONNECTION connection;
++    ULONG index;
++
++    if (ConnectionObject == NULL)
++    {
++        return;
++    }
++
++    for (index = 0; index < *ConnectionObjectCount; index++)
++    {
++        if (ConnectionObjects[index] == ConnectionObject)
++        {
++            return;
++        }
++    }
++
++    connection = GetConnectionObjectContext(ConnectionObject);
++    connection->BridgeReaderReady = FALSE;
++    if (connection->TeardownRequested ||
++        InterlockedCompareExchange(
++            &connection->DeleteRequested,
++            0,
++            0) != 0)
++    {
++        return;
++    }
++
++    // Reservation permits at most one connection for each of the two PSMs.
++    // Two more slots cover objects removed from the list but not yet detached
++    // from the published bridge pointers by a concurrent disconnect callback.
++    NT_ASSERT(*ConnectionObjectCount < ConnectionObjectCapacity);
++    if (*ConnectionObjectCount >= ConnectionObjectCapacity)
++    {
++        return;
++    }
++
++    WdfObjectReference(ConnectionObject);
++    connection->TeardownRequested = TRUE;
++    ConnectionObjects[*ConnectionObjectCount] = ConnectionObject;
++    (*ConnectionObjectCount)++;
++}
++
+ _IRQL_requires_max_(DISPATCH_LEVEL)
+ static VOID
+ SplatplostCompleteReadRequest(
+@@ -150,8 +204,16 @@ SplatplostEvtFileCleanup(
+     _In_ WDFFILEOBJECT FileObject
+     )
+ {
++    WDFOBJECT connectionObjects[SPLATPLOST_CLEANUP_CONNECTION_CAPACITY] =
++        { NULL };
++    WDFOBJECT connectionObject;
+     WDFREQUEST request;
++    PBTHECHO_CONNECTION connection;
++    PLIST_ENTRY entry;
++    ULONG connectionCount = 0;
++    ULONG index;
+     NTSTATUS status;
++    BOOLEAN controllerCleanup = FALSE;
+     PSPLATPLOST_FILE_CONTEXT fileCtx =
+         GetSplatplostFileContext(FileObject);
+     PBTHECHOSAMPLE_SERVER_CONTEXT devCtx =
+@@ -165,13 +227,70 @@ SplatplostEvtFileCleanup(
+     WdfSpinLockAcquire(devCtx->ConnectionListLock);
+     if (devCtx->ControllerFileObject == FileObject)
+     {
++        controllerCleanup = TRUE;
+         devCtx->ControllerFileObject = NULL;
+         devCtx->ControllerCleanupInProgress = TRUE;
++
++        // Include accepted channels that are still connecting and therefore
++        // have not yet been published in ControlConnection/InterruptConnection.
++        // TeardownRequested is set under the same lock used by publication, so
++        // SplatplostBridgeConnectionAdded/Ready cannot publish this old session.
++        for (entry = devCtx->ConnectionList.Flink;
++             entry != &devCtx->ConnectionList;
++             entry = entry->Flink)
++        {
++            connection = CONTAINING_RECORD(
++                entry,
++                BTHECHO_CONNECTION,
++                ConnectionListEntry
++                );
++            SplatplostReferenceConnectionForCleanupLocked(
++                WdfObjectContextGetObject(connection),
++                connectionObjects,
++                RTL_NUMBER_OF(connectionObjects),
++                &connectionCount
++                );
++        }
++        SplatplostReferenceConnectionForCleanupLocked(
++            devCtx->ControlConnection,
++            connectionObjects,
++            RTL_NUMBER_OF(connectionObjects),
++            &connectionCount
++            );
++        SplatplostReferenceConnectionForCleanupLocked(
++            devCtx->InterruptConnection,
++            connectionObjects,
++            RTL_NUMBER_OF(connectionObjects),
++            &connectionCount
++            );
++
++        // Detach the bridge atomically so status-only handles and the next
++        // controller can never observe or consume the departing session.
++        devCtx->ControlConnection = NULL;
++        devCtx->InterruptConnection = NULL;
++        devCtx->BridgeRemoteAddress = BTH_ADDR_NULL;
+         SplatplostResetPacketFifoLocked(devCtx);
+     }
+     fileCtx->OwnsController = FALSE;
+     WdfSpinLockRelease(devCtx->ConnectionListLock);
+ 
++    // CLOSE_CHANNEL BRBs are asynchronous. Submit them outside the spin lock;
++    // the server helper's BRB rundown gate abandons locally instead if surprise
++    // removal has already forbidden new Bluetooth requests.
++    for (index = 0; index < connectionCount; index++)
++    {
++        connectionObject = connectionObjects[index];
++        NT_ASSERT(connectionObject != NULL);
++        if (connectionObject == NULL)
++        {
++            continue;
++        }
++        BthEchoSrvDisconnectConnection(
++            GetConnectionObjectContext(connectionObject)
++            );
++        WdfObjectDereference(connectionObject);
++    }
++
+     // EvtFileCleanup can run while manual-queue requests still exist. Remove
+     // only this controller's reads before admitting a replacement owner.
+     for (;;)
+@@ -197,9 +316,15 @@ SplatplostEvtFileCleanup(
+         WdfRequestComplete(request, STATUS_CANCELLED);
+     }
+ 
+-    WdfSpinLockAcquire(devCtx->ConnectionListLock);
+-    devCtx->ControllerCleanupInProgress = FALSE;
+-    WdfSpinLockRelease(devCtx->ConnectionListLock);
++    if (controllerCleanup)
++    {
++        // The close BRBs need not complete before a replacement opens: the
++        // old objects are teardown-marked and no longer published in the
++        // bridge. Connection state serializes any concurrent disconnect.
++        WdfSpinLockAcquire(devCtx->ConnectionListLock);
++        devCtx->ControllerCleanupInProgress = FALSE;
++        WdfSpinLockRelease(devCtx->ConnectionListLock);
++    }
+ }
+ 
+ VOID

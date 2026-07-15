@@ -1,0 +1,779 @@
+diff --git a/bluetooth/bthecho/bthsrv/sys/device.c b/bluetooth/bthecho/bthsrv/sys/device.c
+index 2eb1648..cb4e4ea 100644
+--- a/bluetooth/bthecho/bthsrv/sys/device.c
++++ b/bluetooth/bthecho/bthsrv/sys/device.c
+@@ -193,17 +193,15 @@ Return Value:
+         goto failed;
+     }
+ 
+-    devCtx->InitializationStage = SPLATPLOST_INIT_STAGE_PSM;
+-    status = BthEchoSrvRegisterPSM(devCtx);
+-    if (!NT_SUCCESS(status))
+-    {
+-        goto failed;
+-    }
++    // Once the notification callback is registered it can queue the pairing
++    // worker immediately. Keep Header.Request serialized until SDP is live.
++    WdfWaitLockAcquire(devCtx->RegistrationLock, NULL);
+ 
+     devCtx->InitializationStage = SPLATPLOST_INIT_STAGE_L2CAP_SERVER;
+     status = BthEchoSrvRegisterL2CAPServer(devCtx);
+     if (!NT_SUCCESS(status))
+     {
++        WdfWaitLockRelease(devCtx->RegistrationLock);
+         goto failed;
+     }
+ 
+@@ -215,15 +213,26 @@ Return Value:
+         );
+     if (!NT_SUCCESS(status))
+     {
++        WdfWaitLockRelease(devCtx->RegistrationLock);
+         goto failed;
+     }
+ 
++    WdfWaitLockRelease(devCtx->RegistrationLock);
++
++    WdfSpinLockAcquire(devCtx->ConnectionListLock);
+     devCtx->InitializationStage = SPLATPLOST_INIT_STAGE_READY;
+     devCtx->InitializationStatus = STATUS_SUCCESS;
++    WdfSpinLockRelease(devCtx->ConnectionListLock);
+     return STATUS_SUCCESS;
+ 
+ failed:
++    if (devCtx->PairingNotificationServerHandle != NULL)
++    {
++        BthEchoSrvStopPairingRegistration(devCtx);
++    }
++    WdfSpinLockAcquire(devCtx->ConnectionListLock);
+     devCtx->InitializationStatus = status;
++    WdfSpinLockRelease(devCtx->ConnectionListLock);
+     return STATUS_SUCCESS;
+ }    
+ 
+@@ -256,18 +265,17 @@ Return Value:
+         
+     PAGED_CODE();
+ 
+-    if (HANDLE_SDP_NULL != devCtx->SdpRecordHandle)
+-    {
+-        BthEchoSrvRemoveSdpRecord(devCtx);        
+-    }
++    // Stop pair callbacks and flush the registration worker before reusing
++    // Header.Request for SDP removal.
++    BthEchoSrvStopPairingRegistration(devCtx);
+ 
+-    if (NULL != devCtx->L2CAPServerHandle)
++    if (HANDLE_SDP_NULL != devCtx->SdpRecordHandle)
+     {
+-        BthEchoSrvUnregisterL2CAPServer(devCtx);
++        WdfWaitLockAcquire(devCtx->RegistrationLock, NULL);
++        BthEchoSrvRemoveSdpRecord(devCtx);
++        WdfWaitLockRelease(devCtx->RegistrationLock);
+     }
+ 
+-    BthEchoSrvUnregisterPSM(devCtx);
+-
+     //
+     // Disconnect any open connections, after this point no more
+     // connections can come beacuse we have unregistered server
+diff --git a/bluetooth/bthecho/bthsrv/sys/device.h b/bluetooth/bthecho/bthsrv/sys/device.h
+index ad3ffac..7366366 100644
+--- a/bluetooth/bthecho/bthsrv/sys/device.h
++++ b/bluetooth/bthecho/bthsrv/sys/device.h
+@@ -1,5 +1,7 @@
+ #include "clisrv.h" 
+ 
++EVT_WDF_WORKITEM BthEchoSrvPairingWorkItem;
++
+ typedef struct _BTHECHOSAMPLE_SERVER_CONTEXT
+ {
+     //
+@@ -8,10 +10,13 @@ typedef struct _BTHECHOSAMPLE_SERVER_CONTEXT
+     BTHECHOSAMPLE_DEVICE_CONTEXT_HEADER Header;
+ 
+     //
+-    // Our Data PSM
++    // Nintendo Switch HID PSMs. Windows owns the wildcard registrations for
++    // these reserved PSMs, so this driver registers address/PSM-specific
++    // L2CAP servers only after a remote device pairs.
+     //    
+     USHORT Psms[2];
+-    BOOLEAN PsmRegistered[2];
++    L2CAP_SERVER_HANDLE DeviceServerHandles[2];
++    BTH_ADDR DeviceServerAddress;
+ 
+     //
+     // Handle to published SDP record
+@@ -19,9 +24,9 @@ typedef struct _BTHECHOSAMPLE_SERVER_CONTEXT
+     HANDLE_SDP SdpRecordHandle;
+ 
+     //
+-    // Handle obtained by registering L2CAP server
++    // Handle for the PSM-less server that receives pair/unpair indications.
+     //
+-    L2CAP_SERVER_HANDLE L2CAPServerHandle;
++    L2CAP_SERVER_HANDLE PairingNotificationServerHandle;
+ 
+     //
+     // BRB used for server and PSM register and unregister
+@@ -31,6 +36,20 @@ typedef struct _BTHECHOSAMPLE_SERVER_CONTEXT
+     // synchronized.
+     //
+     struct _BRB RegisterUnregisterBrb;
++
++    // Serializes all synchronous uses of RegisterUnregisterBrb at PASSIVE_LEVEL.
++    WDFWAITLOCK RegistrationLock;
++
++    // Pairing indications may arrive at DISPATCH_LEVEL. The spin lock protects
++    // the desired pairing state and work-item scheduling flag.
++    WDFSPINLOCK PairingStateLock;
++    WDFWORKITEM PairingWorkItem;
++    BTH_ADDR PendingPairingAddress;
++    ULONG PairingGeneration;
++    BOOLEAN DeviceServersReady;
++    BOOLEAN PendingPairingPresent;
++    BOOLEAN PairingWorkScheduled;
++    BOOLEAN RegistrationStopping;
+     
+     //
+     // Connection List lock
+@@ -64,6 +83,7 @@ BthEchoSampleServerContextInit(
+ {
+     NTSTATUS status;
+     WDF_OBJECT_ATTRIBUTES attributes;
++    WDF_WORKITEM_CONFIG workItemConfig;
+     
+     status = BthEchoSharedDeviceContextHeaderInit(&Context->Header, Device);
+     if (!NT_SUCCESS(status))
+@@ -83,9 +103,44 @@ BthEchoSampleServerContextInit(
+         goto exit;                
+     }
+ 
++    status = WdfSpinLockCreate(
++                               &attributes,
++                               &Context->PairingStateLock
++                               );
++    if (!NT_SUCCESS(status))
++    {
++        goto exit;
++    }
++
++    status = WdfWaitLockCreate(
++                               &attributes,
++                               &Context->RegistrationLock
++                               );
++    if (!NT_SUCCESS(status))
++    {
++        goto exit;
++    }
++
++    WDF_WORKITEM_CONFIG_INIT(
++                             &workItemConfig,
++                             BthEchoSrvPairingWorkItem
++                             );
++    workItemConfig.AutomaticSerialization = FALSE;
++    status = WdfWorkItemCreate(
++                               &workItemConfig,
++                               &attributes,
++                               &Context->PairingWorkItem
++                               );
++    if (!NT_SUCCESS(status))
++    {
++        goto exit;
++    }
++
+     InitializeListHead(&Context->ConnectionList);
+     Context->Psms[0] = 0x0011;
+     Context->Psms[1] = 0x0013;
++    Context->DeviceServerAddress = BTH_ADDR_NULL;
++    Context->PendingPairingAddress = BTH_ADDR_NULL;
+     Context->InitializationStatus = STATUS_DEVICE_NOT_READY;
+     Context->InitializationStage = 0;
+ 
+diff --git a/bluetooth/bthecho/bthsrv/sys/server.c b/bluetooth/bthecho/bthsrv/sys/server.c
+index 0e7bb2f..0272456 100644
+--- a/bluetooth/bthecho/bthsrv/sys/server.c
++++ b/bluetooth/bthecho/bthsrv/sys/server.c
+@@ -37,10 +37,31 @@ BthEchoSrvQueryInterfaces(
+     _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx
+     );
+ 
++_IRQL_requires_max_(DISPATCH_LEVEL)
++static VOID
++BthEchoSrvQueuePairingChange(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
++    _In_ BTH_ADDR BtAddress,
++    _In_ BOOLEAN Paired
++    );
++
++_IRQL_requires_max_(PASSIVE_LEVEL)
++static NTSTATUS
++BthEchoSrvRegisterDeviceServersLocked(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
++    _In_ BTH_ADDR BtAddress
++    );
++
++_IRQL_requires_max_(PASSIVE_LEVEL)
++static NTSTATUS
++BthEchoSrvUnregisterDeviceServersLocked(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx
++    );
++
+ #ifdef ALLOC_PRAGMA
+ #pragma alloc_text (PAGE, BthEchoSrvInitialize)
+-#pragma alloc_text (PAGE, BthEchoSrvUnregisterPSM)
+ #pragma alloc_text (PAGE, BthEchoSrvUnregisterL2CAPServer)
++#pragma alloc_text (PAGE, BthEchoSrvStopPairingRegistration)
+ #pragma alloc_text (PAGE, BthEchoSrvPublishSdpRecord)
+ #pragma alloc_text (PAGE, BthEchoSrvRemoveSdpRecord)
+ #pragma alloc_text (PAGE, BthEchoSrvQueryInterfaces)
+@@ -188,6 +209,27 @@ Arguments:
+         case IndicationRemoteConfigResponse:
+         case IndicationFreeExtraOptions:
+             break;
++        case IndicationPairDevice:
++        {
++            BthEchoSrvQueuePairingChange(
++                (PBTHECHOSAMPLE_SERVER_CONTEXT)Context,
++                Parameters->BtAddress,
++                TRUE
++                );
++            break;
++        }
++        case IndicationUnpairDevice:
++        case IndicationUnpersonalizeDevice:
++        {
++            BthEchoSrvQueuePairingChange(
++                (PBTHECHOSAMPLE_SERVER_CONTEXT)Context,
++                Parameters->BtAddress,
++                FALSE
++                );
++            break;
++        }
++        default:
++            break;
+     }
+ }
+ 
+@@ -320,40 +362,104 @@ Arguments:
+ 
+ #endif
+ 
+-_IRQL_requires_max_(PASSIVE_LEVEL)
+-NTSTATUS
+-BthEchoSrvRegisterPSM(
+-    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx
++_IRQL_requires_max_(DISPATCH_LEVEL)
++static VOID
++BthEchoSrvQueuePairingChange(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
++    _In_ BTH_ADDR BtAddress,
++    _In_ BOOLEAN Paired
+     )
+-/*++
++{
++    BOOLEAN enqueueWorkItem = FALSE;
++    BOOLEAN stateChanged = FALSE;
+ 
+-Description:
++    if (BtAddress == BTH_ADDR_NULL)
++    {
++        return;
++    }
+ 
+-    Registers server PSM.
++    WdfSpinLockAcquire(DevCtx->PairingStateLock);
+ 
+-Arguments:
++    if (!DevCtx->RegistrationStopping)
++    {
++        if (Paired)
++        {
++            if (!DevCtx->PendingPairingPresent ||
++                DevCtx->PendingPairingAddress != BtAddress ||
++                !DevCtx->DeviceServersReady)
++            {
++                DevCtx->PendingPairingPresent = TRUE;
++                DevCtx->PendingPairingAddress = BtAddress;
++                stateChanged = TRUE;
++            }
++        }
++        else if ((DevCtx->PendingPairingPresent &&
++                  DevCtx->PendingPairingAddress == BtAddress) ||
++                 (!DevCtx->PendingPairingPresent &&
++                  DevCtx->DeviceServerAddress == BtAddress))
++        {
++            DevCtx->PendingPairingPresent = FALSE;
++            DevCtx->PendingPairingAddress = BtAddress;
++            stateChanged = TRUE;
++        }
+ 
+-    DevCtx - Device context of the server
++        if (stateChanged)
++        {
++            DevCtx->PairingGeneration++;
++            if (!DevCtx->PairingWorkScheduled)
++            {
++                DevCtx->PairingWorkScheduled = TRUE;
++                enqueueWorkItem = TRUE;
++            }
++        }
++    }
+ 
+-Return Value:
++    WdfSpinLockRelease(DevCtx->PairingStateLock);
+ 
+-    NTSTATUS Status code.
++    if (enqueueWorkItem)
++    {
++        WdfWorkItemEnqueue(DevCtx->PairingWorkItem);
++    }
++}
+ 
+---*/
++_IRQL_requires_max_(PASSIVE_LEVEL)
++static NTSTATUS
++BthEchoSrvUnregisterDeviceServersLocked(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx
++    )
+ {
+-    NTSTATUS status = STATUS_SUCCESS;
+-    struct _BRB_PSM * brb;
+-    ULONG index;
++    NTSTATUS firstFailure = STATUS_SUCCESS;
++    NTSTATUS status;
++    struct _BRB_L2CA_UNREGISTER_SERVER *brb;
++    BTH_ADDR btAddress;
++    LONG index;
+ 
+-    for (index = 0; index < RTL_NUMBER_OF(DevCtx->Psms); index++)
++    PAGED_CODE();
++
++    WdfSpinLockAcquire(DevCtx->PairingStateLock);
++    btAddress = DevCtx->DeviceServerAddress;
++    DevCtx->DeviceServersReady = FALSE;
++    WdfSpinLockRelease(DevCtx->PairingStateLock);
++
++    for (index = RTL_NUMBER_OF(DevCtx->DeviceServerHandles) - 1;
++         index >= 0;
++         index--)
+     {
++        if (DevCtx->DeviceServerHandles[index] == NULL)
++        {
++            continue;
++        }
++
+         DevCtx->Header.ProfileDrvInterface.BthReuseBrb(
+             &(DevCtx->RegisterUnregisterBrb),
+-            BRB_REGISTER_PSM
++            BRB_L2CA_UNREGISTER_SERVER
+             );
+ 
+-        brb = (struct _BRB_PSM *)&(DevCtx->RegisterUnregisterBrb);
++        brb = (struct _BRB_L2CA_UNREGISTER_SERVER *)
++            &(DevCtx->RegisterUnregisterBrb);
++        brb->BtAddress = btAddress;
+         brb->Psm = DevCtx->Psms[index];
++        brb->ServerHandle = DevCtx->DeviceServerHandles[index];
+ 
+         status = BthEchoSharedSendBrbSynchronously(
+             DevCtx->Header.IoTarget,
+@@ -362,64 +468,101 @@ Return Value:
+             sizeof(*brb)
+             );
+ 
+-        if (!NT_SUCCESS(status) || brb->Psm != DevCtx->Psms[index])
++        if (NT_SUCCESS(status))
+         {
+-            if (NT_SUCCESS(status))
++            DevCtx->DeviceServerHandles[index] = NULL;
++        }
++        else
++        {
++            if (NT_SUCCESS(firstFailure))
+             {
+-                status = STATUS_DEVICE_PROTOCOL_ERROR;
++                firstFailure = status;
+             }
+-            BthEchoSrvUnregisterPSM(DevCtx);
+-            goto exit;
++            TraceEvents(
++                TRACE_LEVEL_ERROR,
++                DBG_PNP,
++                "Device-specific L2CAP server unregister failed for PSM 0x%04x, Status code %!STATUS!\n",
++                DevCtx->Psms[index],
++                status
++                );
+         }
++    }
+ 
+-        DevCtx->PsmRegistered[index] = TRUE;
++    if (DevCtx->DeviceServerHandles[0] == NULL &&
++        DevCtx->DeviceServerHandles[1] == NULL)
++    {
++        WdfSpinLockAcquire(DevCtx->PairingStateLock);
++        DevCtx->DeviceServerAddress = BTH_ADDR_NULL;
++        DevCtx->DeviceServersReady = FALSE;
++        WdfSpinLockRelease(DevCtx->PairingStateLock);
+     }
+ 
+-exit:
+-    return status;
++    return firstFailure;
+ }
+ 
+ _IRQL_requires_max_(PASSIVE_LEVEL)
+-VOID
+-BthEchoSrvUnregisterPSM(
+-    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx
++static NTSTATUS
++BthEchoSrvRegisterDeviceServersLocked(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx,
++    _In_ BTH_ADDR BtAddress
+     )
+-/*++
+-
+-Description:
+-
+-    Unregisters server PSM.
+-
+-Arguments:
+-
+-    DevCtx - Device context of the server
++{
++    NTSTATUS status = STATUS_SUCCESS;
++    struct _BRB_L2CA_REGISTER_SERVER *brb;
++    BTH_ADDR registeredAddress = BTH_ADDR_NULL;
++    BOOLEAN serversReady;
++    ULONG index;
+ 
+-Return Value:
++    PAGED_CODE();
+ 
+-    NTSTATUS Status code.
++    if (BtAddress == BTH_ADDR_NULL)
++    {
++        return STATUS_INVALID_PARAMETER;
++    }
+ 
+---*/
+-{
+-    NTSTATUS status;
+-    struct _BRB_PSM * brb;
+-    LONG index;
++    WdfSpinLockAcquire(DevCtx->PairingStateLock);
++    registeredAddress = DevCtx->DeviceServerAddress;
++    serversReady = DevCtx->DeviceServersReady;
++    WdfSpinLockRelease(DevCtx->PairingStateLock);
+ 
+-    PAGED_CODE();
++    if (serversReady &&
++        registeredAddress == BtAddress &&
++        DevCtx->DeviceServerHandles[0] != NULL &&
++        DevCtx->DeviceServerHandles[1] != NULL)
++    {
++        return STATUS_SUCCESS;
++    }
+ 
+-    for (index = RTL_NUMBER_OF(DevCtx->Psms) - 1; index >= 0; index--)
++    if (DevCtx->DeviceServerHandles[0] != NULL ||
++        DevCtx->DeviceServerHandles[1] != NULL)
+     {
+-        if (!DevCtx->PsmRegistered[index])
++        status = BthEchoSrvUnregisterDeviceServersLocked(DevCtx);
++        if (!NT_SUCCESS(status))
+         {
+-            continue;
++            return status;
+         }
++    }
+ 
++    WdfSpinLockAcquire(DevCtx->PairingStateLock);
++    DevCtx->DeviceServerAddress = BtAddress;
++    WdfSpinLockRelease(DevCtx->PairingStateLock);
++
++    for (index = 0; index < RTL_NUMBER_OF(DevCtx->Psms); index++)
++    {
+         DevCtx->Header.ProfileDrvInterface.BthReuseBrb(
+             &(DevCtx->RegisterUnregisterBrb),
+-            BRB_UNREGISTER_PSM
++            BRB_L2CA_REGISTER_SERVER
+             );
+ 
+-        brb = (struct _BRB_PSM *)&(DevCtx->RegisterUnregisterBrb);
+-        brb->Psm = DevCtx->Psms[index];
++        brb = (struct _BRB_L2CA_REGISTER_SERVER *)
++            &(DevCtx->RegisterUnregisterBrb);
++        brb->BtAddress = BtAddress;
++        brb->PSM = DevCtx->Psms[index];
++        brb->IndicationCallback = &BthEchoSrvIndicationCallback;
++        brb->IndicationCallbackContext = DevCtx;
++        brb->IndicationFlags = 0;
++        brb->ReferenceObject =
++            WdfDeviceWdmGetDeviceObject(DevCtx->Header.Device);
+ 
+         status = BthEchoSharedSendBrbSynchronously(
+             DevCtx->Header.IoTarget,
+@@ -428,11 +571,113 @@ Return Value:
+             sizeof(*brb)
+             );
+ 
+-        NT_ASSERT(NT_SUCCESS(status));
+-        if (NT_SUCCESS(status))
++        if (!NT_SUCCESS(status))
++        {
++            TraceEvents(
++                TRACE_LEVEL_ERROR,
++                DBG_PNP,
++                "Device-specific L2CAP server registration failed for PSM 0x%04x, Status code %!STATUS!\n",
++                DevCtx->Psms[index],
++                status
++                );
++            (void)BthEchoSrvUnregisterDeviceServersLocked(DevCtx);
++            return status;
++        }
++
++        DevCtx->DeviceServerHandles[index] = brb->ServerHandle;
++    }
++
++    WdfSpinLockAcquire(DevCtx->PairingStateLock);
++    DevCtx->DeviceServersReady = TRUE;
++    WdfSpinLockRelease(DevCtx->PairingStateLock);
++
++    return STATUS_SUCCESS;
++}
++
++VOID
++BthEchoSrvPairingWorkItem(
++    _In_ WDFWORKITEM WorkItem
++    )
++{
++    PBTHECHOSAMPLE_SERVER_CONTEXT devCtx;
++    WDFDEVICE device;
++    BTH_ADDR btAddress;
++    BTH_ADDR registeredAddress = BTH_ADDR_NULL;
++    BOOLEAN paired;
++    BOOLEAN stopping;
++    ULONG generation;
++    NTSTATUS status = STATUS_SUCCESS;
++
++    PAGED_CODE();
++
++    device = (WDFDEVICE)WdfWorkItemGetParentObject(WorkItem);
++    devCtx = GetServerDeviceContext(device);
++
++    for (;;)
++    {
++        WdfSpinLockAcquire(devCtx->PairingStateLock);
++        stopping = devCtx->RegistrationStopping;
++        generation = devCtx->PairingGeneration;
++        btAddress = devCtx->PendingPairingAddress;
++        paired = devCtx->PendingPairingPresent;
++        WdfSpinLockRelease(devCtx->PairingStateLock);
++
++        if (!stopping)
++        {
++            WdfWaitLockAcquire(devCtx->RegistrationLock, NULL);
++
++            WdfSpinLockAcquire(devCtx->PairingStateLock);
++            stopping = devCtx->RegistrationStopping;
++            registeredAddress = devCtx->DeviceServerAddress;
++            WdfSpinLockRelease(devCtx->PairingStateLock);
++
++            if (!stopping)
++            {
++                if (paired)
++                {
++                    status = BthEchoSrvRegisterDeviceServersLocked(
++                        devCtx,
++                        btAddress
++                        );
++                }
++                else if (registeredAddress == btAddress)
++                {
++                    status = BthEchoSrvUnregisterDeviceServersLocked(devCtx);
++                }
++                else
++                {
++                    status = STATUS_SUCCESS;
++                }
++            }
++
++            WdfWaitLockRelease(devCtx->RegistrationLock);
++        }
++
++        if (!stopping)
+         {
+-            DevCtx->PsmRegistered[index] = FALSE;
++            WdfSpinLockAcquire(devCtx->ConnectionListLock);
++            if (NT_SUCCESS(status))
++            {
++                devCtx->InitializationStage = SPLATPLOST_INIT_STAGE_READY;
++                devCtx->InitializationStatus = STATUS_SUCCESS;
++            }
++            else
++            {
++                devCtx->InitializationStage = SPLATPLOST_INIT_STAGE_PSM;
++                devCtx->InitializationStatus = status;
++            }
++            WdfSpinLockRelease(devCtx->ConnectionListLock);
+         }
++
++        WdfSpinLockAcquire(devCtx->PairingStateLock);
++        if (devCtx->RegistrationStopping ||
++            generation == devCtx->PairingGeneration)
++        {
++            devCtx->PairingWorkScheduled = FALSE;
++            WdfSpinLockRelease(devCtx->PairingStateLock);
++            break;
++        }
++        WdfSpinLockRelease(devCtx->PairingStateLock);
+     }
+ }
+ 
+@@ -460,6 +705,8 @@ Return Value:
+     NTSTATUS status;
+     struct _BRB_L2CA_REGISTER_SERVER *brb;
+ 
++    // The caller holds RegistrationLock so notification registration and SDP
++    // publication cannot race the pairing work item on Header.Request.
+     DevCtx->Header.ProfileDrvInterface.BthReuseBrb(
+         &(DevCtx->RegisterUnregisterBrb), 
+         BRB_L2CA_REGISTER_SERVER
+@@ -472,10 +719,15 @@ Return Value:
+     // Format brb
+     //
+     brb->BtAddress = BTH_ADDR_NULL;
+-    brb->PSM = 0; //we have already registered the PSM
++    // This PSM-less server exists only to receive pair/unpair indications.
++    // Reserved HID PSMs are registered later as address-specific servers.
++    brb->PSM = 0;
+     brb->IndicationCallback = &BthEchoSrvIndicationCallback;
+     brb->IndicationCallbackContext = DevCtx;
+-    brb->IndicationFlags = 0;
++    brb->IndicationFlags =
++        INDICATION_PAIR_DEVICE |
++        INDICATION_UNPAIR_DEVICE |
++        INDICATION_UNPERSONALIZE_DEVICE;
+     brb->ReferenceObject = WdfDeviceWdmGetDeviceObject(DevCtx->Header.Device);
+ 
+     status = BthEchoSharedSendBrbSynchronously(
+@@ -488,14 +740,14 @@ Return Value:
+     if (!NT_SUCCESS(status))
+     {
+         TraceEvents(TRACE_LEVEL_ERROR, DBG_PNP, 
+-            "BRB_REGISTER_PSM failed, Status code %!STATUS!\n", status);
++            "Pairing notification server registration failed, Status code %!STATUS!\n", status);
+         goto exit;        
+     }
+ 
+     //
+     // Store server handle
+     //
+-    DevCtx->L2CAPServerHandle = brb->ServerHandle;
++    DevCtx->PairingNotificationServerHandle = brb->ServerHandle;
+ 
+ exit:
+     return status;
+@@ -527,11 +779,13 @@ Return Value:
+ 
+     PAGED_CODE();
+ 
+-    if (NULL == DevCtx->L2CAPServerHandle)
++    if (NULL == DevCtx->PairingNotificationServerHandle)
+     {
+         return;
+     }
+ 
++    // The caller holds RegistrationLock. This serializes Header.Request with
++    // the work item and SDP teardown.
+     DevCtx->Header.ProfileDrvInterface.BthReuseBrb(
+         &(DevCtx->RegisterUnregisterBrb), 
+         BRB_L2CA_UNREGISTER_SERVER
+@@ -544,8 +798,8 @@ Return Value:
+     // Format Brb
+     //
+     brb->BtAddress = BTH_ADDR_NULL ;//DevCtx->LocalAddress;
+-    brb->Psm = 0; //since we will use unregister PSM to unregister.
+-    brb->ServerHandle = DevCtx->L2CAPServerHandle;
++    brb->Psm = 0;
++    brb->ServerHandle = DevCtx->PairingNotificationServerHandle;
+ 
+     status = BthEchoSharedSendBrbSynchronously(
+         DevCtx->Header.IoTarget,
+@@ -567,12 +821,36 @@ Return Value:
+         goto exit;        
+     }
+ 
+-    DevCtx->L2CAPServerHandle = NULL;
++    DevCtx->PairingNotificationServerHandle = NULL;
+ 
+ exit:
+     return;
+ }
+ 
++_IRQL_requires_max_(PASSIVE_LEVEL)
++VOID
++BthEchoSrvStopPairingRegistration(
++    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx
++    )
++{
++    PAGED_CODE();
++
++    WdfSpinLockAcquire(DevCtx->PairingStateLock);
++    DevCtx->RegistrationStopping = TRUE;
++    DevCtx->PairingGeneration++;
++    WdfSpinLockRelease(DevCtx->PairingStateLock);
++
++    // Stop callbacks first, then wait for the one reusable worker to finish.
++    WdfWaitLockAcquire(DevCtx->RegistrationLock, NULL);
++    BthEchoSrvUnregisterL2CAPServer(DevCtx);
++    WdfWaitLockRelease(DevCtx->RegistrationLock);
++    WdfWorkItemFlush(DevCtx->PairingWorkItem);
++
++    WdfWaitLockAcquire(DevCtx->RegistrationLock, NULL);
++    (void)BthEchoSrvUnregisterDeviceServersLocked(DevCtx);
++    WdfWaitLockRelease(DevCtx->RegistrationLock);
++}
++
+ _IRQL_requires_max_(PASSIVE_LEVEL)
+ NTSTATUS
+ BthEchoSrvPublishSdpRecord(
+diff --git a/bluetooth/bthecho/bthsrv/sys/server.h b/bluetooth/bthecho/bthsrv/sys/server.h
+index 9a181bb..85d598c 100644
+--- a/bluetooth/bthecho/bthsrv/sys/server.h
++++ b/bluetooth/bthecho/bthsrv/sys/server.h
+@@ -30,25 +30,19 @@ BthEchoSrvInitialize(
+ 
+ _IRQL_requires_max_(PASSIVE_LEVEL)
+ NTSTATUS
+-BthEchoSrvRegisterPSM(
++BthEchoSrvRegisterL2CAPServer(
+     _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx
+     );
+ 
+ _IRQL_requires_max_(PASSIVE_LEVEL)
+ VOID
+-BthEchoSrvUnregisterPSM(
+-    _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx
+-    );
+-
+-_IRQL_requires_max_(PASSIVE_LEVEL)
+-NTSTATUS
+-BthEchoSrvRegisterL2CAPServer(
++BthEchoSrvUnregisterL2CAPServer(
+     _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx
+     );
+ 
+ _IRQL_requires_max_(PASSIVE_LEVEL)
+ VOID
+-BthEchoSrvUnregisterL2CAPServer(
++BthEchoSrvStopPairingRegistration(
+     _In_ PBTHECHOSAMPLE_SERVER_CONTEXT DevCtx
+     );
+ 
+warning: LF will be replaced by CRLF in bluetooth/bthecho/bthsrv/sys/device.c.
+The file will have its original line endings in your working directory
+warning: LF will be replaced by CRLF in bluetooth/bthecho/bthsrv/sys/server.c.
+The file will have its original line endings in your working directory

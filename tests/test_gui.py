@@ -31,6 +31,55 @@ class GuiTests(unittest.TestCase):
         with patch("splatplost.gui.plotter.sys.platform", "win32"):
             self.assertEqual(available_backends()[0], "Windows Bluetooth")
 
+    def test_shutdown_disconnects_active_and_pending_connections(self):
+        class FakeConnection:
+            def __init__(self):
+                self.disconnect_count = 0
+
+            def disconnect(self):
+                self.disconnect_count += 1
+
+        form = QtWidgets.QMainWindow()
+        window = PlotterUI(self.app, form)
+        window.setupUi(form)
+        active = FakeConnection()
+        pending = FakeConnection()
+        window.connection = active
+        window._pending_connection = pending
+
+        window.shutdown()
+
+        self.assertEqual(active.disconnect_count, 1)
+        self.assertEqual(pending.disconnect_count, 1)
+        self.assertIsNone(window.connection)
+        self.assertIsNone(window._pending_connection)
+
+    def test_rejecting_pairing_cancels_and_disconnects_unconfirmed_connection(self):
+        import threading
+
+        class FakeConnection:
+            def __init__(self):
+                self.disconnected = False
+
+            def disconnect(self):
+                self.disconnected = True
+
+        form = QtWidgets.QMainWindow()
+        window = PlotterUI(self.app, form)
+        window.setupUi(form)
+        connection = FakeConnection()
+        cancel_event = threading.Event()
+        window.connection = connection
+        window._unconfirmed_connection = connection
+        window._pairing_cancel_event = cancel_event
+
+        window.cancel_pending_pairing()
+
+        self.assertTrue(cancel_event.is_set())
+        self.assertTrue(connection.disconnected)
+        self.assertIsNone(window.connection)
+        window.shutdown()
+
     def test_remote_server_address_adds_default_protocol(self):
         self.assertEqual(
                 normalize_remote_server_address("192.168.1.10:8000"),

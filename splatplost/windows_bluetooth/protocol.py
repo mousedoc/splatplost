@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import random
 import time
+from collections import deque
 from threading import RLock
 
 from libnxctrl.wrapper import Button
@@ -56,18 +57,26 @@ class SwitchProtocol:
         self.timer = 0
         self.timestamp = time.perf_counter()
         self.vibrator_report = random.choice((0xA0, 0xB0, 0xC0, 0x90))
-        self._pending_reply: bytes | None = None
+        self._pending_replies: deque[bytes] = deque()
 
     @property
     def handshake_complete(self) -> bool:
         return self.vibration_enabled and self.player_number is not None
+
+    @property
+    def has_pending_replies(self) -> bool:
+        with self.lock:
+            return bool(self._pending_replies)
 
     def set_buttons(self, buttons: Button) -> None:
         with self.lock:
             self.buttons = buttons
 
     def process_switch_report(self, data: bytes) -> None:
-        if len(data) < 12 or data[0] != 0xA2:
+        # A Switch output report is 50 bytes. Treat a short transfer as a
+        # malformed report instead of acknowledging a partially received
+        # subcommand with missing parameters.
+        if len(data) < self.REPORT_SIZE or data[0] != 0xA2:
             return
 
         subcommand = data[11]
@@ -105,14 +114,12 @@ class SwitchProtocol:
                 report[49] = 0xC8
             else:
                 return
-            self._pending_reply = bytes(report)
+            self._pending_replies.append(bytes(report))
 
     def next_input_report(self) -> bytes:
         with self.lock:
-            if self._pending_reply is not None:
-                report = self._pending_reply
-                self._pending_reply = None
-                return report
+            if self._pending_replies:
+                return self._pending_replies.popleft()
             return bytes(self._standard_report())
 
     def _empty_report(self, report_id: int) -> bytearray:

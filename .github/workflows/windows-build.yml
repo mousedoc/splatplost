@@ -2,8 +2,19 @@ name: Build Windows release
 
 on:
   push:
-    tags: ["*"]
+    tags: ["v*.*.*"]
   workflow_dispatch:
+    inputs:
+      driver_version:
+        description: Windows DriverVer version (w.x.y.z)
+        required: true
+        default: "0.3.1.0"
+        type: string
+      driver_date:
+        description: Optional Windows DriverVer date (MM/dd/yyyy); defaults to the UTC build date
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
@@ -14,10 +25,10 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -26,7 +37,43 @@ jobs:
         run: python -m pip install --upgrade ".[build]"
 
       - name: Run tests
-        run: python -m unittest discover -s tests -v
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tests -v
+          if ($LASTEXITCODE -ne 0) { throw "Python tests failed with exit code $LASTEXITCODE." }
+
+          $testScripts = @(
+            "./native/windows_bluetooth/test-build-versioning.ps1",
+            "./native/windows_bluetooth/test-installer-scripts.ps1",
+            "./native/windows_bluetooth/test-verify-runtime.ps1"
+          )
+          $testShells = @(
+            @{
+              Name = "PowerShell 7"
+              Path = (Get-Command pwsh -ErrorAction Stop).Source
+            },
+            @{
+              Name = "Windows PowerShell 5.1"
+              Path = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+            }
+          )
+          foreach ($testShell in $testShells) {
+            if (-not (Test-Path -LiteralPath $testShell.Path -PathType Leaf)) {
+              throw "$($testShell.Name) is unavailable at $($testShell.Path)."
+            }
+            foreach ($script in $testScripts) {
+              $scriptPath = (Resolve-Path -LiteralPath $script).Path
+              & $testShell.Path `
+                -NoLogo `
+                -NoProfile `
+                -NonInteractive `
+                -ExecutionPolicy Bypass `
+                -File $scriptPath
+              if ($LASTEXITCODE -ne 0) {
+                throw "$script failed under $($testShell.Name) with exit code $LASTEXITCODE."
+              }
+            }
+          }
 
       - name: Build splatplost.exe
         run: >-
@@ -43,8 +90,82 @@ jobs:
         shell: pwsh
         run: |
           $env:QT_QPA_PLATFORM = "offscreen"
+          $executablePath = (Resolve-Path -LiteralPath ".\dist\splatplost.exe").Path
+
+          $stream = [IO.File]::OpenRead($executablePath)
+          $reader = [IO.BinaryReader]::new($stream)
+          try {
+            if ($reader.ReadUInt16() -ne 0x5A4D) { throw "Executable has no DOS MZ header." }
+            $stream.Position = 0x3C
+            $peOffset = $reader.ReadInt32()
+            $stream.Position = $peOffset
+            if ($reader.ReadUInt32() -ne 0x00004550) { throw "Executable has no PE signature." }
+            $machine = $reader.ReadUInt16()
+            $stream.Position = $peOffset + 24
+            $optionalMagic = $reader.ReadUInt16()
+            $stream.Position = $peOffset + 24 + 68
+            $subsystem = $reader.ReadUInt16()
+          } finally {
+            $reader.Dispose()
+          }
+          if ($machine -ne 0x8664 -or $optionalMagic -ne 0x020B -or $subsystem -ne 2) {
+            throw ("Expected an x64 PE32+ Windows GUI executable; " +
+              "machine=0x{0:X4}, optionalMagic=0x{1:X4}, subsystem={2}." -f `
+              $machine, $optionalMagic, $subsystem)
+          }
+
+          $guiProcess = Start-Process -FilePath $executablePath -PassThru
+          try {
+            Start-Sleep -Seconds 3
+            if ($guiProcess.HasExited) {
+              throw "No-argument GUI exited prematurely with code $($guiProcess.ExitCode)."
+            }
+          } finally {
+            if (-not $guiProcess.HasExited) {
+              & "$env:SystemRoot\System32\taskkill.exe" /PID $guiProcess.Id /T /F | Out-Null
+              if ($LASTEXITCODE -ne 0) {
+                throw "Failed to stop the no-argument GUI process tree."
+              }
+            }
+          }
+
           $process = Start-Process -FilePath ".\dist\splatplost.exe" -ArgumentList "--smoke-test" -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "GUI smoke test failed with exit code $($process.ExitCode)" }
+
+          $acceptanceEvidence = ".\ci-application-evidence.json"
+          $process = Start-Process `
+            -FilePath ".\dist\splatplost.exe" `
+            -ArgumentList @(
+              "--verify-windows-bluetooth",
+              "--evidence-path", $acceptanceEvidence,
+              "--pairing-timeout-seconds", "0.1",
+              "--handshake-timeout-seconds", "0.1",
+              "--settle-seconds", "0"
+            ) `
+            -Wait `
+            -PassThru
+          if ($process.ExitCode -eq 0) { throw "Application acceptance unexpectedly passed without the Splatplost driver." }
+          if (-not (Test-Path -LiteralPath $acceptanceEvidence -PathType Leaf)) {
+            throw "Packaged application did not write failure evidence."
+          }
+          $acceptance = Get-Content -LiteralPath $acceptanceEvidence -Raw | ConvertFrom-Json
+          $expectedVersion = (& python -c "from splatplost.version import __version__; print(__version__)").Trim()
+          $actualExecutableSha256 = (Get-FileHash -LiteralPath ".\dist\splatplost.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          if (
+            [int]$acceptance.schemaVersion -ne 1 -or
+            [string]$acceptance.evidenceType -ne "splatplost-windows-bluetooth-application" -or
+            -not ($acceptance.passed -is [bool]) -or
+            $acceptance.passed -or
+            -not $acceptance.failure -or
+            -not [bool]$acceptance.application.frozenExecutable -or
+            [string]$acceptance.application.version -ne $expectedVersion -or
+            [string]$acceptance.application.executableSha256 -notmatch '^[0-9a-f]{64}$' -or
+            [string]$acceptance.application.executableSha256 -ne $actualExecutableSha256 -or
+            -not ($acceptance.checks.packagedExecutable -is [bool]) -or
+            -not [bool]$acceptance.checks.packagedExecutable
+          ) {
+            throw "Packaged application failure evidence is invalid."
+          }
 
       - name: Verify Windows Driver Kit
         shell: pwsh
@@ -61,23 +182,91 @@ jobs:
 
       - name: Build native Windows Bluetooth driver
         shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TAG_NAME: ${{ github.ref_name }}
+          DISPATCH_DRIVER_VERSION: ${{ inputs.driver_version }}
+          DISPATCH_DRIVER_DATE: ${{ inputs.driver_date }}
         run: |
-          ./native/windows_bluetooth/build-driver.ps1 -Configuration Release -Platform x64
-          ./native/windows_bluetooth/sign-test-driver.ps1 -PackageDirectory ./native/windows_bluetooth/out
+          if ($env:EVENT_NAME -eq "push") {
+            if ($env:TAG_NAME -notmatch '^v(?<version>(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$') {
+              throw "Release tags must use canonical vX.Y.Z notation."
+            }
+            $driverVersion = "$($Matches['version']).0"
+            $driverDate = [DateTime]::UtcNow.ToString("MM/dd/yyyy", [Globalization.CultureInfo]::InvariantCulture)
+          } elseif ($env:EVENT_NAME -eq "workflow_dispatch") {
+            $driverVersion = $env:DISPATCH_DRIVER_VERSION
+            $driverDate = if ([string]::IsNullOrWhiteSpace($env:DISPATCH_DRIVER_DATE)) {
+              [DateTime]::UtcNow.ToString("MM/dd/yyyy", [Globalization.CultureInfo]::InvariantCulture)
+            } else {
+              $env:DISPATCH_DRIVER_DATE
+            }
+          } else {
+            throw "Unsupported workflow event: $env:EVENT_NAME"
+          }
+
+          $appVersion = (& python -c "from splatplost.version import __version__; print(__version__)").Trim()
+          $driverReleaseVersion = (($driverVersion -split '\.')[0..2] -join '.')
+          if ($appVersion -ne $driverReleaseVersion) {
+            throw "Application version $appVersion does not match driver/release version $driverReleaseVersion."
+          }
+
+          ./native/windows_bluetooth/build-driver.ps1 `
+            -Configuration Release `
+            -Platform x64 `
+            -DriverVersion $driverVersion `
+            -DriverDate $driverDate
+          ./native/windows_bluetooth/partner-center/prepare-submission-cab.ps1 `
+            -PackageDirectory ./native/windows_bluetooth/out `
+            -SymbolsPath ./native/windows_bluetooth/out/SplatplostBluetooth.pdb `
+            -OutputPath ./SplatplostBluetooth-attestation-unsigned.cab `
+            -PrepareOnly
+
+      - name: Build isolated development driver package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path development-driver | Out-Null
+          Copy-Item native/windows_bluetooth/out/* development-driver
+          Copy-Item native/windows_bluetooth/README.md development-driver/DRIVER_README.md
+          Copy-Item .github/user_guide_kr.md development-driver/USER_GUIDE_KR.md
+          ./native/windows_bluetooth/sign-test-driver.ps1 -PackageDirectory ./development-driver
+          ./native/windows_bluetooth/partner-center/test-packaging-scripts.ps1 `
+            -DevelopmentPackageDirectory ./development-driver
+          Compress-Archive `
+            -Path development-driver/* `
+            -DestinationPath splatplost-windows-bluetooth-development-x64.zip `
+            -Force
 
       - name: Stage Windows artifact
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path package | Out-Null
           Copy-Item dist\splatplost.exe, readme.md, LICENSE package
-          Copy-Item native\windows_bluetooth\out\* package
           Compress-Archive -Path package\* -DestinationPath splatplost-windows-x64.zip -Force
 
       - name: Upload Windows artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: splatplost-windows-x64
           path: package/*
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload development driver artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: splatplost-windows-bluetooth-development-x64
+          path: development-driver/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Hardware Dev Center submission artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: splatplost-windows-bluetooth-attestation-submission
+          path: |
+            SplatplostBluetooth-attestation-unsigned.cab
+            SplatplostBluetooth-attestation-unsigned.cab.manifest.json
           if-no-files-found: error
           retention-days: 90
 
@@ -86,8 +275,20 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release create "$env:GITHUB_REF_NAME"
-          "splatplost-windows-x64.zip#Windows x64"
-          --verify-tag
-          --generate-notes
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $assets = @(
+            "splatplost-windows-x64.zip#Windows x64"
+            "splatplost-windows-bluetooth-development-x64.zip#Windows Bluetooth driver (development only)"
+          )
+
+          gh release view "$env:GITHUB_REF_NAME" *> $null
+          $releaseExists = $LASTEXITCODE -eq 0
+          if ($releaseExists) {
+            gh release upload "$env:GITHUB_REF_NAME" @assets --clobber
+          } else {
+            gh release create "$env:GITHUB_REF_NAME" @assets --verify-tag --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) {
+            throw "GitHub Release publishing failed with exit code $LASTEXITCODE."
+          }

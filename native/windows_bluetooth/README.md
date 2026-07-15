@@ -1,37 +1,107 @@
 # Native Windows Bluetooth backend
 
-This directory builds a Windows KMDF Bluetooth profile driver that makes the PC radio expose the Nintendo Switch Pro Controller HID service. It is the native counterpart to the BlueZ L2CAP sockets used by NXBT/libnxctrl on Linux; it does not use a VM, serial port, or external controller-emulation board.
+This directory contains an experimental Windows KMDF Bluetooth profile driver and the user-mode bridge used by Splatplost. The goal is to expose the PC as a Nintendo Switch Pro Controller without BlueZ, a VM, or an external controller-emulation board.
 
-## Components
+## Architecture
 
-- `windows-driver-samples.patch` adapts Microsoft's Bluetooth Echo L2CAP sample to register HID control PSM `0x11` and interrupt PSM `0x13` and expose a `\\.\SplatplostBluetooth` user-mode bridge.
-- `windows-driver-diagnostics.patch` keeps the bridge available when Bluetooth initialization fails so the installer and app can report the exact failing stage and NTSTATUS.
-- `switch-controller.xml` is the Pro Controller SDP/HID record used by NXBT.
-- `generate_switch_sdp.py` serializes the SDP XML into the static record submitted by the Windows Bluetooth stack.
-- `build-driver.ps1` checks out the pinned Microsoft sample commit, applies the patch, and builds the x64 driver plus local-service helper.
-- `install-driver.ps1` stages the driver, enables the local profile, and saves/replaces the host Class of Device with Peripheral/Gamepad values.
-- `install-driver.cmd` and `uninstall-driver.cmd` launch the PowerShell installers with a process-scoped execution-policy bypass.
-- `uninstall-driver.ps1` disables the profile and restores the previous Class of Device values.
+- `windows-driver-samples.patch` adapts Microsoft's Bluetooth Echo sample and adds the `\\.\SplatplostBluetooth` bridge.
+- `windows-driver-diagnostics.patch` exposes initialization stage, NTSTATUS, local radio address, and the two connected-channel bits even when initialization fails.
+- `windows-driver-specific-psm.patch` removes wildcard `BRB_REGISTER_PSM` calls for reserved HID PSMs. It receives a pairing notification, moves work to PASSIVE_LEVEL, then registers `(Switch address, 0x11)` and `(Switch address, 0x13)` L2CAP servers separately.
+- `windows-driver-runtime-hardening.patch` hardens request lifetimes, child-list state, status synchronization, report queues, and cleanup/cancellation paths for KMDF verification.
+- `switch-controller.xml` and `generate_switch_sdp.py` produce the Pro Controller SDP/HID record.
+- `install-driver.ps1` verifies the complete package before mutation, locks concurrent operations, journals recovery state, pins the profile to exactly one radio, installs the INF, and proves the installed device/package identity and SYS hash.
+- `uninstall-driver.ps1` unregisters the profile on that exact radio, deletes every verified Splatplost `oem*.inf`, and removes installer-owned certificates/restores the previous Class of Device only after absence is proved.
+- `verify-runtime.ps1` writes fail-closed JSON evidence for Secure Boot, HVCI, signing, PnP, driver initialization, and both HID channels.
 
-The upstream sample is pinned to commit `2ee527bfeb0aeb6be11f0a8b6dce4011b358ce89` so the patch and build are reproducible.
+The upstream sample is pinned to commit `2ee527bfeb0aeb6be11f0a8b6dce4011b358ce89` so patch application is reproducible.
 
-## Build
+Microsoft documents address-specific L2CAP server registration, but does not explicitly guarantee that an address-specific registration for reserved HID PSMs will coexist with `HidBth`, nor that a PSM-less notification server will receive pairing events without a wildcard PSM registration. The implementation therefore remains experimental until positive evidence is collected on a real Windows radio and Nintendo Switch.
 
-Visual Studio 2022 with Desktop development for C++, Windows SDK 26100, WDK 26100, and the Visual Studio Driver Kit component are required. The pinned `windows-2022` GitHub Actions runner supplies those components and verifies them before compiling the driver.
+## Build and static validation
+
+The target is Windows 10 version 2004 (build 19041) or later on x64. The supported build environment is Visual Studio 2022 with Desktop development for C++, the Windows SDK/WDK, and the Visual Studio Driver Kit component. The tag workflow verifies WDK 26100 on `windows-2022`, enables MSBuild code analysis, and compiles x64 Release with level-4 warnings treated as errors. Before release, the same sources must also pass InfVerif, Inf2Cat, strict API validation, `/sdl`, and the WDK `DriverRecommended`/`DriverMustFix` rule sets; the current 0.3.1 source passed that validation with zero compiler or analysis warnings.
 
 ```powershell
-./native/windows_bluetooth/build-driver.ps1 -Configuration Release -Platform x64
-./native/windows_bluetooth/sign-test-driver.ps1 -PackageDirectory ./native/windows_bluetooth/out
+.\build-driver.ps1 -Configuration Release -Platform x64
+python -m unittest discover -s ..\..\tests -v
+.\test-build-versioning.ps1
+.\test-installer-scripts.ps1
+.\test-verify-runtime.ps1
+.\partner-center\test-packaging-scripts.ps1
 ```
 
-GitHub Actions performs both commands and packages the result with `splatplost.exe`.
+`prepare-driver.ps1` cleans ignored output below its owned sample directory before applying the four patches. `build-driver.ps1` copies only the exact requested configuration's SYS, INF, PDB, and helper, preventing an old Debug or Release binary from being selected recursively. The build manifest records the exact INF/SYS identity and driver version; a release tag `vX.Y.Z` must match application version `X.Y.Z` and driver version `X.Y.Z.0`.
 
-## Driver signing boundary
+## Signing and release boundary
 
-The Actions package is development-signed for hardware testing. It requires Windows test-signing mode and cannot load while Secure Boot enforces Microsoft signatures. Distribution to ordinary Secure Boot systems requires submitting the generated driver package to Microsoft Hardware Dev Center for attestation or WHQL signing. That final signature cannot be generated from source code or a public GitHub runner because it requires the publisher's Partner Center identity and signing account.
+A public GitHub runner can compile and development-sign this driver, but it cannot create a normal Secure Boot signature. That requires an organization registered in Microsoft Hardware Dev Center, an accepted EV signing identity, the required Microsoft Entra/organization roles, and the submission path appropriate for the release policy.
+
+1. Build the unsigned package.
+2. Create and sign the Hardware Dev Center CAB. `-PrepareOnly` is for structural CI evidence only; it does not create a submit-ready identity signature.
+
+```powershell
+.\partner-center\prepare-submission-cab.ps1 `
+  -PackageDirectory .\out `
+  -SymbolsPath .\out\SplatplostBluetooth.pdb `
+  -OutputPath .\SplatplostBluetooth-attestation.cab `
+  -SigningCertificateThumbprint <registered-certificate-thumbprint> `
+  -TimestampUrl <rfc3161-url>
+```
+
+3. Submit the CAB to Hardware Dev Center. Since April 14, 2026, attestation signing is for testing scenarios only; use the HLK/WHCP path for a production release policy. The repository's structural CAB and local static-analysis results are not HLK/WHCP certification evidence; the registered organization must run the required HLK and static-tool/CodeQL tests on qualified hardware.
+4. Download the returned `signedPackage`, then verify and assemble it with the matching build's helper and scripts.
+
+```powershell
+.\partner-center\verify-signed-package.ps1 `
+  -SignedPackagePath <signedPackage.zip> `
+  -RunInfVerif
+
+.\partner-center\assemble-signed-release.ps1 `
+  -SignedPackagePath <signedPackage.zip> `
+  -BuildOutputDirectory .\out
+```
+
+The verifier requires a valid Microsoft catalog signature, catalog membership for the INF and SYS, a valid isolated embedded SYS signature, and a Microsoft hardware-signing EKU. The assembler verifies before and after copying, excludes a stale development certificate, and produces a flat ZIP.
+
+The GitHub workflow keeps outputs distinct:
+
+- `splatplost-windows-x64`: application only;
+- `splatplost-windows-bluetooth-development-x64`: test-signed driver for isolated driver-development machines;
+- `splatplost-windows-bluetooth-attestation-submission`: unsigned structural CAB and manifest for maintainer processing.
+
+## Runtime evidence
+
+On a Windows 10 2004+ x64 target PC, leave exactly one Bluetooth Classic radio enabled. With the returned Microsoft-signed package, install and restart, remove any pre-existing Switch pairing, pair again, and run while both channels are connected. `-PackageDirectory` is mandatory because Driver Store does not retain the release manifest, signature evidence, or support-file hashes. Install a current Windows SDK; the verifier accepts only a trusted x64 SignTool below Windows Kits.
+
+```powershell
+.\verify-runtime.ps1 -PackageDirectory . -RequireConnected
+```
+
+A pass requires Secure Boot on, TESTSIGNING off, HVCI running, healthy PnP/service state, matching installed binary, Microsoft signing, initialization stage 5 with success status, the installed radio address, and both PSM `0x11` and `0x13` channel bits.
+
+Close the GUI and run the packaged application acceptance separately; it opens its own bridge connection:
+
+```powershell
+$acceptance = Start-Process -FilePath .\splatplost.exe -ArgumentList @(
+  "--verify-windows-bluetooth",
+  "--evidence-path", ".\SplatplostBluetooth-application-evidence.json"
+) -Wait -PassThru
+$acceptance.ExitCode
+```
+
+Exit code `0` plus `"passed": true` binds the evidence to the frozen executable version and SHA-256 hash and proves the device-info, vibration-enable, and player-assignment handshake over both channels, followed by an alive/status check. Neither JSON proves that a complete drawing was accepted by Splatoon; one real drawing remains the final physical acceptance test.
+
+The installer and uninstaller serialize operations through a global mutex and retain a durable recovery journal. The same radio must remain enabled for uninstall. If removal requires a reboot or cannot prove that all matching devices and Driver Store packages are absent, restart and rerun `uninstall-driver.cmd`; do not manually delete certificates, Class of Device values, or the recovery registry keys.
+
+## Microsoft references
+
+- [Accepting L2CAP connections in a Bluetooth profile driver](https://learn.microsoft.com/windows-hardware/drivers/bluetooth/accepting-l2cap-connections-in-a-bluetooth-profile-driver)
+- [Driver signing options](https://learn.microsoft.com/windows-hardware/drivers/dashboard/driver-signing-offerings)
+- [Attestation signing submission](https://learn.microsoft.com/windows-hardware/drivers/dashboard/code-signing-attestation)
+- [Hardware program registration](https://learn.microsoft.com/windows-hardware/drivers/dashboard/hardware-program-register)
 
 ## Attributions
 
 - Bluetooth L2CAP driver foundation: Microsoft Windows Driver Samples.
-- Switch HID SDP and controller protocol behavior: Brikwerk/NXBT.
+- Switch HID SDP and controller protocol behavior: Brikwerk/NXBT revision `ec4b800ad6c55de96bb6c7f9f84b5bdc59a4c975`.
 - Splatplost backend interface and input model: Victrid/libnxctrl.

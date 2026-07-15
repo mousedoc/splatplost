@@ -7,7 +7,7 @@ index bf1902a..5281bd5 100644
    </ImportGroup>
    <ItemGroup Label="WrappedTaskItems">
 -    <ClCompile Include="sdp.c; server.c; driver.c; device.c; echo.c">
-+    <ClCompile Include="sdp.c; server.c; driver.c; device.c; echo.c; bridge.c">
++    <ClCompile Include="server.c; driver.c; device.c; echo.c; bridge.c">
        <WppEnabled>true</WppEnabled>
        <WppKernelMode>true</WppKernelMode>
        <WppTraceFunction>TraceEvents(LEVEL,FLAGS,MSG,...)</WppTraceFunction>

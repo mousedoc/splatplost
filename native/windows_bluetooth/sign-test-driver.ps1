@@ -26,7 +26,7 @@ $certificate = New-SelfSignedCertificate `
 Export-Certificate -Cert $certificate -FilePath (Join-Path $package "SplatplostDevelopment.cer") | Out-Null
 & $signtool.FullName sign /v /fd SHA256 /sha1 $certificate.Thumbprint (Join-Path $package "SplatplostBluetooth.sys")
 if ($LASTEXITCODE -ne 0) { throw "The test driver signing step failed." }
-& $inf2cat.FullName "/driver:$package" /os:10_X64
+& $inf2cat.FullName "/driver:$package" "/os:10_VB_X64,10_CO_X64,10_NI_X64,10_GE_X64"
 if ($LASTEXITCODE -ne 0) { throw "The driver catalog generation step failed." }
 & $signtool.FullName sign /v /fd SHA256 /sha1 $certificate.Thumbprint (Join-Path $package "SplatplostBluetooth.cat")
 if ($LASTEXITCODE -ne 0) { throw "The test catalog signing step failed." }

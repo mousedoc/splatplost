@@ -65,7 +65,8 @@ purpose and non-infringement.
 
 ## NXBT
 
-The Switch HID SDP record and controller protocol behavior are based on NXBT.
+The Switch HID SDP record and controller protocol behavior are based on NXBT
+revision ec4b800ad6c55de96bb6c7f9f84b5bdc59a4c975.
 
 MIT License
 

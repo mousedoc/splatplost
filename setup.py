@@ -4,10 +4,15 @@ from setuptools import find_packages, setup
 
 this_directory = Path(__file__).parent
 long_description = (this_directory / "readme.md").read_text(encoding="utf-8")
+version_namespace = {}
+exec(
+        (this_directory / "splatplost" / "version.py").read_text(encoding="utf-8"),
+        version_namespace,
+        )
 
 setup(
         name='splatplost',
-        version='0.3.0',
+        version=version_namespace['__version__'],
         packages=find_packages(),
         url='https://github.com/Victrid/splatplost',
         license='GPLv3',

@@ -65,6 +65,8 @@ class ConnectToSwitchUI(Form_ConnectToSwitch):
     def error_pairing(self, err: Exception):
         self.start_pairing.setEnabled(True)
         self.start_pairing.setText(QApplication.translate("@default", "Start Pairing"))
+        if isinstance(err, ConnectionAbortedError):
+            return
         if isinstance(err, PermissionError):
             return spawn_error_dialog(err, QApplication.translate("@default", "Permission Error (Run as root?)"),
                                       reportable=False
@@ -74,7 +76,7 @@ class ConnectToSwitchUI(Form_ConnectToSwitch):
     def done_clicked(self):
         self.parent.ready_for_drawing()
         if self.parent_dialog:
-            self.parent_dialog.close()
+            self.parent_dialog.accept()
 
     def press_a_clicked(self):
         self.parent.press_a()
@@ -87,3 +89,4 @@ class ConnectToSwitchUI(Form_ConnectToSwitch):
         self.press_a.clicked.connect(self.press_a_clicked)
 
         self.parent_dialog = connect_to_switch
+        connect_to_switch.rejected.connect(self.parent.cancel_pending_pairing)
