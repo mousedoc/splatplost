@@ -154,7 +154,7 @@ Invoke-Test "trusted SignTool resolution rejects writable aliases and post-resol
             Resolve-TrustedSignTool -ExplicitPath $fake | Out-Null
         }
 
-        Assert-Throws -MessagePattern "untrusted owner|user-writable" -Action {
+        Assert-Throws -MessagePattern "untrusted owner|user-writable|grants write access to an untrusted principal" -Action {
             Assert-TrustedSignToolFileSystemPath -Path $fake -TrustedRoot $temporary | Out-Null
         }
 
