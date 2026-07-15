@@ -326,6 +326,42 @@ Invoke-Test "PowerShell scripts parse without errors" {
     }
 }
 
+Invoke-Test "WDK resolver accepts the official x86 Inf2Cat host tool" {
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile($prepareScript, [ref]$tokens, [ref]$parseErrors)
+    Assert-True ($parseErrors.Count -eq 0) "Submission script could not be parsed for the WDK resolver regression test."
+    foreach ($functionName in @("Resolve-ExistingFile", "Resolve-WdkTool")) {
+        $functionAst = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq $functionName
+        }, $true)
+        Assert-True ($null -ne $functionAst) "$functionName was not found."
+        . ([ScriptBlock]::Create($functionAst.Extent.Text))
+    }
+
+    $root = Join-Path ([IO.Path]::GetTempPath()) ("splatplost-wdk-tool-test-" + [Guid]::NewGuid().ToString("N"))
+    $programFilesX86 = Join-Path $root "Program Files (x86)"
+    $inf2Cat = Join-Path $programFilesX86 "Windows Kits\10\bin\10.0.26100.0\x86\Inf2Cat.exe"
+    $oldProgramFilesX86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)", "Process")
+    $oldPath = $env:PATH
+    try {
+        New-Item -ItemType Directory -Force -Path ([IO.Path]::GetDirectoryName($inf2Cat)) | Out-Null
+        Set-Content -LiteralPath $inf2Cat -Value "mock" -NoNewline
+        [Environment]::SetEnvironmentVariable("ProgramFiles(x86)", $programFilesX86, "Process")
+        $env:PATH = ""
+        $resolved = Resolve-WdkTool -Name "Inf2Cat.exe"
+        Assert-True (
+            [string]::Equals($resolved, $inf2Cat, [StringComparison]::OrdinalIgnoreCase)
+        ) "The x86 Inf2Cat host utility was not resolved."
+    } finally {
+        $env:PATH = $oldPath
+        [Environment]::SetEnvironmentVariable("ProgramFiles(x86)", $oldProgramFilesX86, "Process")
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Invoke-Test "build copies the PDB adjacent to the selected SYS" {
     $source = Get-Content -LiteralPath $buildScript -Raw
     Assert-True ($source -match 'Join-Path \$driverBuildDirectory "SplatplostBluetooth\.pdb"') "build-driver.ps1 does not bind symbols to the exact selected build directory."

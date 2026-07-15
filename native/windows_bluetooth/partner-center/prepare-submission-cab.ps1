@@ -51,9 +51,17 @@ function Resolve-WdkTool {
         (Join-Path $env:USERPROFILE ".nuget\packages\microsoft.windows.wdk.x64")
     ) | Where-Object { Test-Path -LiteralPath $_ -PathType Container }
 
+    # The WDK ships Inf2Cat as an x86 host utility even when it validates an
+    # x64 driver package. Other tools used here must still resolve to x64.
+    $architecturePattern = if ($Name -ieq "Inf2Cat.exe") {
+        "\\(x86|x64|amd64)\\"
+    } else {
+        "\\(x64|amd64)\\"
+    }
+
     foreach ($root in $roots) {
         $candidate = Get-ChildItem -LiteralPath $root -Recurse -Filter $Name -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match "\\(x64|amd64)\\" } |
+            Where-Object { $_.FullName -match $architecturePattern } |
             Sort-Object FullName -Descending |
             Select-Object -First 1
         if ($candidate) {

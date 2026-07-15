@@ -45,7 +45,8 @@ jobs:
           $testScripts = @(
             "./native/windows_bluetooth/test-build-versioning.ps1",
             "./native/windows_bluetooth/test-installer-scripts.ps1",
-            "./native/windows_bluetooth/test-verify-runtime.ps1"
+            "./native/windows_bluetooth/test-verify-runtime.ps1",
+            "./native/windows_bluetooth/partner-center/test-packaging-scripts.ps1"
           )
           $testShells = @(
             @{
