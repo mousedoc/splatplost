@@ -1,0 +1,15 @@
+diff --git a/bluetooth/bthecho/bthsrv/sys/BthEchoSampleSrv.vcxproj b/bluetooth/bthecho/bthsrv/sys/BthEchoSampleSrv.vcxproj
+--- a/bluetooth/bthecho/bthsrv/sys/BthEchoSampleSrv.vcxproj
++++ b/bluetooth/bthecho/bthsrv/sys/BthEchoSampleSrv.vcxproj
+@@ -192,7 +192,10 @@
+     </DriverSign>
+   </ItemDefinitionGroup>
+   <ItemGroup>
+-    <Inf Exclude="@(Inf)" Include="*.inx" />
++    <Inf Exclude="@(Inf)" Include="*.inx">
++      <SpecifyDriverVerDirectiveDate>false</SpecifyDriverVerDirectiveDate>
++      <SpecifyDriverVerDirectiveVersion>false</SpecifyDriverVerDirectiveVersion>
++    </Inf>
+     <FilesToPackage Include="$(TargetPath)" Condition="'$(ConfigurationType)'=='Driver' or '$(ConfigurationType)'=='DynamicLibrary'" />
+   </ItemGroup>
+   <ItemGroup>

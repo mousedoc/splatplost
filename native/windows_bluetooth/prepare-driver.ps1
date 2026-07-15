@@ -58,6 +58,8 @@ git -C $destination apply (Join-Path $PSScriptRoot "windows-driver-specific-psm.
 if ($LASTEXITCODE -ne 0) { throw "Unable to apply the device-specific HID PSM patch." }
 git -C $destination apply (Join-Path $PSScriptRoot "windows-driver-runtime-hardening.patch")
 if ($LASTEXITCODE -ne 0) { throw "Unable to apply the Windows runtime hardening patch." }
+git -C $destination apply (Join-Path $PSScriptRoot "windows-driver-versioning.patch")
+if ($LASTEXITCODE -ne 0) { throw "Unable to apply the Windows driver versioning patch." }
 
 $serverSource = Join-Path $destination "bluetooth\bthecho\bthsrv\sys"
 Remove-Item -LiteralPath (Join-Path $serverSource "BthEchoSampleSrv.inx") -Force

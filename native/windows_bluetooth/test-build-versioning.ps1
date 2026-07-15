@@ -35,6 +35,8 @@ function Invoke-Test {
 
 $buildScript = Join-Path $PSScriptRoot "build-driver.ps1"
 $infTemplate = Join-Path $PSScriptRoot "SplatplostBluetooth.inx"
+$prepareScript = Join-Path $PSScriptRoot "prepare-driver.ps1"
+$versioningPatch = Join-Path $PSScriptRoot "windows-driver-versioning.patch"
 $repositoryRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $workflow = Join-Path $repositoryRoot ".github\workflows\windows-build.yml"
 
@@ -132,6 +134,18 @@ Invoke-Test "explicit identity validation precedes dependency preparation" {
         Assert-True ($source.Contains($field)) "Build manifest is missing the stamped identity field: $field"
     }
     Assert-True ($source.Contains('"/p:RunCodeAnalysis=true"')) "The WDK build does not run native code analysis."
+}
+
+Invoke-Test "WDK StampInf preserves the validated driver identity" {
+    $prepareSource = Get-Content -LiteralPath $prepareScript -Raw
+    $patchSource = Get-Content -LiteralPath $versioningPatch -Raw
+    Assert-True ($prepareSource.Contains('windows-driver-versioning.patch')) "The versioning patch is not applied during driver preparation."
+    foreach ($required in @(
+        '<SpecifyDriverVerDirectiveDate>false</SpecifyDriverVerDirectiveDate>',
+        '<SpecifyDriverVerDirectiveVersion>false</SpecifyDriverVerDirectiveVersion>'
+    )) {
+        Assert-True ($patchSource.Contains($required)) "The WDK build can still overwrite the validated DriverVer identity: $required"
+    }
 }
 
 Invoke-Test "tag and manual workflow builds supply validated driver identities" {
