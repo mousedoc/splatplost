@@ -1186,4 +1186,5 @@ if ($script:Failures -ne 0) {
     throw "$script:Failures packaging script test(s) failed."
 }
 
+$global:LASTEXITCODE = 0
 Write-Host "ALL TESTS PASSED"
